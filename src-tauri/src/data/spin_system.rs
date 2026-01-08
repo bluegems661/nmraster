@@ -42,6 +42,90 @@ pub enum PeakExperimentType {
     Hbhaconh,
 }
 
+// ============================================================================
+// PHYSICS-BASED OBSERVATION MODEL
+// ============================================================================
+// These types encode the PHYSICS of NMR experiments rather than experiment names.
+// Factor logic should reason about these properties, not experiment_type.
+
+/// How magnetization was transferred between nuclei in an observation.
+/// This encodes the PHYSICS of the NMR experiment, not the experiment name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferPathway {
+    /// One-bond J-coupling (e.g., HSQC). Nuclei are directly bonded.
+    /// Implies: same atom pair, same residue.
+    DirectBond,
+
+    /// Multi-bond J-coupling (e.g., TOCSY). Nuclei are in the same spin system.
+    /// Implies: same residue, any J-coupled atom pair within the spin system.
+    ThroughBond,
+
+    /// Dipolar coupling (e.g., NOESY). Nuclei are spatially close (<6Å).
+    /// Implies: close in 3D space, may cross residue boundaries.
+    ThroughSpace,
+
+    /// Backbone J-pathway (triple-resonance experiments like HNCA, HNCACB).
+    /// Specific backbone magnetization transfer: 1H → 15N → 13C.
+    /// Some experiments show both intra (i) and inter (i-1) peaks.
+    BackboneSequential,
+}
+
+/// Relationship of an observed nucleus to the "anchor" residue of the observation.
+/// For backbone-anchored experiments, the anchor is defined by the H/N pair (residue i).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResidueOffset {
+    /// This dimension observes the anchor residue (i).
+    /// Examples: all HSQC dimensions, TOCSY (same spin system), strong HNCA CA.
+    Intra,
+
+    /// This dimension observes the preceding residue (i-1).
+    /// Examples: weak HNCA CA, negative HNCACB CA/CB, all CBCACONH carbons.
+    PrecedingResidue,
+
+    /// This dimension observes the following residue (i+1).
+    /// Rare in standard experiments, but could occur in certain pulse sequences.
+    FollowingResidue,
+
+    /// Residue relationship is ambiguous or unknown.
+    /// Examples: NOESY (distance-based, may cross residues), unanchored TOCSY.
+    Unknown,
+}
+
+/// Constraints on which atoms are physically possible for an observed dimension.
+/// These are hard constraints derived from experiment physics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AtomConstraint {
+    /// Must be exactly this atom (e.g., "H" for backbone amide, "N" for backbone nitrogen).
+    Exact(String),
+
+    /// Must be one of these atoms (e.g., ["CA", "CB"] for HNCACB carbon dimension).
+    OneOf(Vec<String>),
+
+    /// Any atom of this nucleus type (no constraint beyond nucleus).
+    /// Used when atom identity must be inferred from chemical shift.
+    Any,
+}
+
+impl AtomConstraint {
+    /// Check if an atom name satisfies this constraint.
+    pub fn allows(&self, atom: &str) -> bool {
+        match self {
+            AtomConstraint::Exact(a) => a == atom,
+            AtomConstraint::OneOf(atoms) => atoms.iter().any(|a| a == atom),
+            AtomConstraint::Any => true,
+        }
+    }
+
+    /// Get allowed atom names, if constrained.
+    pub fn allowed_atoms(&self) -> Option<Vec<&str>> {
+        match self {
+            AtomConstraint::Exact(a) => Some(vec![a.as_str()]),
+            AtomConstraint::OneOf(atoms) => Some(atoms.iter().map(|s| s.as_str()).collect()),
+            AtomConstraint::Any => None, // Caller should use full atom list for nucleus
+        }
+    }
+}
+
 /// An unlabeled peak from an NMR experiment.
 ///
 /// This represents raw experimental data without atom assignments.

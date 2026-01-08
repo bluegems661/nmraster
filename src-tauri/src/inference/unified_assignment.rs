@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use ndarray::Array1;
 use uuid::Uuid;
 
-use crate::data::{PeakExperimentType, UnlabeledPeak};
+use crate::data::{PeakExperimentType, UnlabeledPeak, TransferPathway, ResidueOffset, AtomConstraint};
 use crate::data::spectrum::NucleusType;
 use crate::inference::scoring::{KDEScorer, ShiftScorer};
 use crate::testdata::{BMRBDatabase, KDEDatabase};
@@ -35,20 +35,33 @@ use crate::testdata::{BMRBDatabase, KDEDatabase};
 
 /// A single observation from ANY experiment type.
 /// This is the unified representation where HSQC, TOCSY, NOESY, etc. are all first-class.
+///
+/// Now includes physics-based metadata for factor reasoning:
+/// - `transfer_pathway`: How magnetization moved (DirectBond, ThroughBond, ThroughSpace, BackboneSequential)
+/// - `is_sequential_evidence`: Whether this observation provides inter-residue connectivity
 #[derive(Debug, Clone)]
 pub struct Observation {
     pub id: Uuid,
-    /// What was observed (any combination of dimensions)
+    /// What was observed (any combination of dimensions with physics metadata)
     pub dimensions: Vec<ObservedDimension>,
-    /// Which experiment type produced this observation
+    /// Which experiment type produced this observation (METADATA ONLY - not for factor logic)
     pub experiment_type: PeakExperimentType,
     /// Original intensity for weighting
     pub intensity: f64,
     /// Ground truth for testing (optional)
     pub ground_truth: Option<GroundTruth>,
+
+    // === PHYSICS-BASED FIELDS ===
+
+    /// How magnetization was transferred to produce this observation.
+    /// Factor logic should use this instead of experiment_type.
+    pub transfer_pathway: TransferPathway,
+    /// Whether this observation provides sequential connectivity evidence.
+    /// True for inter-residue observations (e.g., weak HNCA, CBCACONH).
+    pub is_sequential_evidence: bool,
 }
 
-/// A single dimension of an observation with its nucleus type and chemical shift.
+/// A single dimension of an observation with its nucleus type, chemical shift, and physics metadata.
 #[derive(Debug, Clone)]
 pub struct ObservedDimension {
     /// Nucleus type (H1, C13, N15, etc.)
@@ -56,7 +69,15 @@ pub struct ObservedDimension {
     /// Chemical shift in ppm
     pub shift: f64,
     /// Atom name hint (e.g., "HN", "HA", "CA") - used for typing
+    /// DEPRECATED: Prefer atom_constraint for new code
     pub atom_hint: Option<String>,
+
+    // === PHYSICS-BASED FIELDS ===
+
+    /// Residue relationship: is this dimension observing i, i-1, or unknown?
+    pub residue_offset: ResidueOffset,
+    /// Which atoms are physically possible for this dimension?
+    pub atom_constraint: AtomConstraint,
 }
 
 /// Ground truth for testing purposes.
@@ -139,148 +160,360 @@ impl NucleusToleranceParams {
 }
 
 impl Observation {
-    /// Create a new observation from raw peak data.
+    /// Create a new observation from raw peak data, populating physics metadata.
+    ///
+    /// Physics fields (transfer_pathway, residue_offset, atom_constraint, is_sequential_evidence)
+    /// are populated based on experiment type AT CREATION TIME. After this, factor logic should
+    /// use these physics fields instead of experiment_type.
     pub fn from_unlabeled_peak(peak: &UnlabeledPeak) -> Option<Self> {
-        let dimensions = match peak.experiment_type {
-            PeakExperimentType::Hsqc15N => {
-                // [N_ppm, H_ppm]
-                vec![
+        use PeakExperimentType::*;
+
+        let (dimensions, transfer_pathway, is_sequential_evidence) = match peak.experiment_type {
+            // === DIRECT BOND: HSQC experiments ===
+            // One-bond J-coupling. Both nuclei are at the same residue (intra).
+            Hsqc15N => {
+                let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::N15,
                         shift: peak.position_ppm[0],
                         atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
                     },
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[1],
                         atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
                     },
-                ]
+                ];
+                (dims, TransferPathway::DirectBond, false)
             }
-            PeakExperimentType::Hsqc13C => {
-                // [C_ppm, H_ppm]
-                vec![
+
+            Hsqc13C => {
+                let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::C13,
                         shift: peak.position_ppm[0],
-                        atom_hint: None,  // Could be CA, CB, CG, etc.
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        // Could be any aliphatic carbon
+                        atom_constraint: AtomConstraint::OneOf(vec![
+                            "CA".into(), "CB".into(), "CG".into(), "CG1".into(), "CG2".into(),
+                            "CD".into(), "CD1".into(), "CD2".into(), "CE".into(), "CE1".into(), "CE2".into(),
+                        ]),
                     },
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[1],
-                        atom_hint: None,  // Could be HA, HB, HG, etc.
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
                     },
-                ]
+                ];
+                (dims, TransferPathway::DirectBond, false)
             }
-            PeakExperimentType::Tocsy => {
-                // [H1_ppm, H2_ppm] - both protons
-                vec![
+
+            // === THROUGH-BOND: TOCSY experiments ===
+            // Multi-bond J-coupling. Both protons are in the same spin system (same residue).
+            Tocsy => {
+                let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[0],
                         atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
                     },
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[1],
                         atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
                     },
-                ]
+                ];
+                (dims, TransferPathway::ThroughBond, false)
             }
-            PeakExperimentType::Noesy => {
-                // [H1_ppm, H2_ppm] - both protons
-                vec![
+
+            // === THROUGH-SPACE: NOESY experiments ===
+            // Dipolar coupling. Protons may be from different residues.
+            Noesy => {
+                let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[0],
                         atom_hint: None,
+                        residue_offset: ResidueOffset::Unknown,
+                        atom_constraint: AtomConstraint::Any,
                     },
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[1],
                         atom_hint: None,
+                        residue_offset: ResidueOffset::Unknown,
+                        atom_constraint: AtomConstraint::Any,
                     },
-                ]
+                ];
+                (dims, TransferPathway::ThroughSpace, false)
             }
-            PeakExperimentType::HsqcTocsy15N => {
-                // [N_ppm, H_tocsy_ppm]
-                vec![
+
+            // === HSQC-TOCSY: Hybrid experiments ===
+            // DirectBond anchor + ThroughBond extension
+            HsqcTocsy15N => {
+                let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::N15,
                         shift: peak.position_ppm[0],
                         atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
                     },
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[1],
-                        atom_hint: None,  // Could be any proton in spin system
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
                     },
-                ]
+                ];
+                (dims, TransferPathway::ThroughBond, false)
             }
-            PeakExperimentType::HsqcTocsy13C => {
-                // [C_ppm, H_tocsy_ppm]
-                vec![
+
+            HsqcTocsy13C => {
+                let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::C13,
                         shift: peak.position_ppm[0],
                         atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
                     },
                     ObservedDimension {
                         nucleus: NucleusType::H1,
                         shift: peak.position_ppm[1],
                         atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
                     },
-                ]
+                ];
+                (dims, TransferPathway::ThroughBond, false)
             }
-            PeakExperimentType::Hnca => {
-                // [H_ppm, N_ppm, CA_ppm]
-                if peak.position_ppm.len() >= 3 {
-                    vec![
-                        ObservedDimension {
-                            nucleus: NucleusType::H1,
-                            shift: peak.position_ppm[0],
-                            atom_hint: Some("HN".to_string()),
-                        },
-                        ObservedDimension {
-                            nucleus: NucleusType::N15,
-                            shift: peak.position_ppm[1],
-                            atom_hint: Some("N".to_string()),
-                        },
-                        ObservedDimension {
-                            nucleus: NucleusType::C13,
-                            shift: peak.position_ppm[2],
-                            atom_hint: Some("CA".to_string()),
-                        },
-                    ]
-                } else {
-                    return None;
-                }
+
+            // === BACKBONE SEQUENTIAL: Triple-resonance experiments ===
+            // Specific backbone magnetization transfer paths.
+            // Intra vs inter determined by intensity.
+
+            Hnca => {
+                if peak.position_ppm.len() < 3 { return None; }
+                // Strong intensity = intra (i), weak = inter (i-1)
+                let is_intra = peak.intensity > 0.5;
+                let carbon_offset = if is_intra { ResidueOffset::Intra } else { ResidueOffset::PrecedingResidue };
+                let is_seq = !is_intra;
+
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::N15,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[2],
+                        atom_hint: Some("CA".to_string()),
+                        residue_offset: carbon_offset,
+                        atom_constraint: AtomConstraint::Exact("CA".to_string()),
+                    },
+                ];
+                (dims, TransferPathway::BackboneSequential, is_seq)
             }
-            PeakExperimentType::Hncacb | PeakExperimentType::Cbcaconh => {
-                // [H_ppm, N_ppm, CA/CB_ppm]
-                if peak.position_ppm.len() >= 3 {
-                    vec![
-                        ObservedDimension {
-                            nucleus: NucleusType::H1,
-                            shift: peak.position_ppm[0],
-                            atom_hint: Some("HN".to_string()),
-                        },
-                        ObservedDimension {
-                            nucleus: NucleusType::N15,
-                            shift: peak.position_ppm[1],
-                            atom_hint: Some("N".to_string()),
-                        },
-                        ObservedDimension {
-                            nucleus: NucleusType::C13,
-                            shift: peak.position_ppm[2],
-                            atom_hint: None,  // Could be CA or CB
-                        },
-                    ]
-                } else {
-                    return None;
-                }
+
+            Hncacb => {
+                if peak.position_ppm.len() < 3 { return None; }
+                // Positive intensity = intra (i), negative = inter (i-1)
+                let is_intra = peak.intensity > 0.0;
+                let carbon_offset = if is_intra { ResidueOffset::Intra } else { ResidueOffset::PrecedingResidue };
+                let is_seq = !is_intra;
+
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::N15,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[2],
+                        atom_hint: None,
+                        residue_offset: carbon_offset,
+                        atom_constraint: AtomConstraint::OneOf(vec!["CA".into(), "CB".into()]),
+                    },
+                ];
+                (dims, TransferPathway::BackboneSequential, is_seq)
             }
-            _ => return None,  // Unsupported experiment type for now
+
+            Cbcaconh => {
+                if peak.position_ppm.len() < 3 { return None; }
+                // CBCACONH ALWAYS shows i-1 carbons (inter-residue only)
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::N15,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[2],
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::PrecedingResidue,
+                        atom_constraint: AtomConstraint::OneOf(vec!["CA".into(), "CB".into()]),
+                    },
+                ];
+                (dims, TransferPathway::BackboneSequential, true)
+            }
+
+            Hnco => {
+                if peak.position_ppm.len() < 3 { return None; }
+                // HNCO shows CO(i-1)
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::N15,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[2],
+                        atom_hint: Some("C".to_string()),
+                        residue_offset: ResidueOffset::PrecedingResidue,
+                        atom_constraint: AtomConstraint::Exact("C".to_string()),
+                    },
+                ];
+                (dims, TransferPathway::BackboneSequential, true)
+            }
+
+            Hbhaconh => {
+                if peak.position_ppm.len() < 3 { return None; }
+                // HBHACONH shows HA/HB(i-1)
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::N15,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[2],
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::PrecedingResidue,
+                        atom_constraint: AtomConstraint::OneOf(vec!["HA".into(), "HA2".into(), "HA3".into(), "HB".into(), "HB2".into(), "HB3".into()]),
+                    },
+                ];
+                (dims, TransferPathway::BackboneSequential, true)
+            }
+
+            // 3D HSQC-TOCSY variants
+            HsqcTocsy15N3D => {
+                if peak.position_ppm.len() < 3 { return None; }
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::N15,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[2],
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
+                    },
+                ];
+                (dims, TransferPathway::ThroughBond, false)
+            }
+
+            HsqcTocsy13C3D => {
+                if peak.position_ppm.len() < 3 { return None; }
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[0],
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[1],
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[2],
+                        atom_hint: None,
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Any,
+                    },
+                ];
+                (dims, TransferPathway::ThroughBond, false)
+            }
         };
 
         Some(Self {
@@ -289,6 +522,8 @@ impl Observation {
             experiment_type: peak.experiment_type,
             intensity: peak.intensity,
             ground_truth: None,
+            transfer_pathway,
+            is_sequential_evidence,
         })
     }
 
@@ -2855,19 +3090,25 @@ fn compute_observation_typing_scores(
 }
 
 /// Score how well an observation matches a residue type.
+///
+/// Physics-based: uses atom_constraint instead of nucleus-based guessing.
+/// NOTE: For now, we use ALL dimensions for typing, including inter-residue carbons.
+/// A more sophisticated model would need to handle that inter-residue observations
+/// provide evidence about BOTH the anchor residue AND the preceding residue.
 fn score_observation_for_residue_type(
     obs: &Observation,
     res_type: &str,
     kde: &KDEDatabase,
     _tol_params: &NucleusToleranceParams,
-    iteration: usize,
+    _iteration: usize,
     _max_iterations: usize,
 ) -> f64 {
     let mut log_score = 0.0;
     let debug_this = false;  // Disable verbose debug
 
     for dim in &obs.dimensions {
-        let atom_candidates = atoms_for_nucleus_and_hint(dim.nucleus, &dim.atom_hint);
+        // Physics-based: use atom_constraint instead of nucleus-based guessing
+        let atom_candidates = atoms_from_constraint(&dim.atom_constraint, dim.nucleus);
         let mut best_density = 1e-10;
         let mut best_atom = "";
 
@@ -2880,8 +3121,8 @@ fn score_observation_for_residue_type(
         }
 
         if debug_this {
-            println!("  SCORE: {} {:?} hint={:?} shift={:.2} -> atoms={:?}, best={}:{:.2e}",
-                     res_type, dim.nucleus, dim.atom_hint, dim.shift, atom_candidates, best_atom, best_density);
+            println!("  SCORE: {} {:?} constraint={:?} shift={:.2} -> atoms={:?}, best={}:{:.2e}",
+                     res_type, dim.nucleus, dim.atom_constraint, dim.shift, atom_candidates, best_atom, best_density);
         }
 
         log_score += best_density.max(1e-10).ln();
@@ -2893,6 +3134,51 @@ fn score_observation_for_residue_type(
     }
 
     score
+}
+
+/// Convert AtomConstraint to atom candidates for KDE scoring.
+fn atoms_from_constraint(constraint: &crate::data::spin_system::AtomConstraint, nucleus: NucleusType) -> Vec<&'static str> {
+    use crate::data::spin_system::AtomConstraint;
+
+    match constraint {
+        AtomConstraint::Exact(atom) => {
+            // Map the atom name to a static str we can return
+            match atom.as_str() {
+                "H" | "HN" => vec!["H"],
+                "N" => vec!["N"],
+                "CA" => vec!["CA"],
+                "CB" => vec!["CB"],
+                "HA" => vec!["HA", "HA2", "HA3"],
+                "C" => vec!["C"],
+                _ => atoms_for_nucleus(nucleus),
+            }
+        }
+        AtomConstraint::OneOf(atoms) => {
+            // Convert the Vec<String> to static atom names
+            let mut result = Vec::new();
+            for atom in atoms {
+                match atom.as_str() {
+                    "CA" => result.push("CA"),
+                    "CB" => result.push("CB"),
+                    "H" | "HN" => result.push("H"),
+                    "HA" => {
+                        result.push("HA");
+                        result.push("HA2");
+                        result.push("HA3");
+                    }
+                    "N" => result.push("N"),
+                    "C" => result.push("C"),
+                    _ => {}
+                }
+            }
+            if result.is_empty() {
+                atoms_for_nucleus(nucleus)
+            } else {
+                result
+            }
+        }
+        AtomConstraint::Any => atoms_for_nucleus(nucleus),
+    }
 }
 
 /// Get candidate atoms for a nucleus type and optional atom hint.
@@ -2969,13 +3255,17 @@ fn compute_observation_correlations(
     correlations
 }
 
-/// Compute correlation between two observations based on NMR experiment physics.
+/// Compute correlation between two observations based on magnetization transfer PHYSICS.
 ///
-/// Key insight: different experiment types have different correlation semantics:
-/// - TOCSY H↔H: same spin system → same residue
-/// - Triple-resonance sharing H/N: same backbone anchor, but NOT same residue!
-///   (HNCA shows CA(i) and CA(i-1) at the same H/N position)
-/// - Carbon matching across different backbones: sequential evidence
+/// This function uses physics-based fields (transfer_pathway, residue_offset) instead of
+/// experiment_type to determine correlations. This allows the same logic to handle any
+/// experiment that produces observations with the same physics properties.
+///
+/// Correlation semantics by transfer pathway:
+/// - DirectBond: Nuclei are directly bonded → matching shifts means same residue
+/// - ThroughBond: Nuclei are J-coupled → matching shifts means same spin system (residue)
+/// - BackboneSequential: Check residue_offset to determine if observing same residue
+/// - ThroughSpace: Distance-dependent, handled separately (no direct correlation here)
 fn compute_observation_pair_correlation(
     obs_a: &Observation,
     obs_b: &Observation,
@@ -2983,8 +3273,6 @@ fn compute_observation_pair_correlation(
     iteration: usize,
     max_iterations: usize,
 ) -> f64 {
-    use PeakExperimentType::*;
-
     let h_tol = tol_params.tolerance_for(NucleusType::H1, iteration, max_iterations);
     let n_tol = tol_params.tolerance_for(NucleusType::N15, iteration, max_iterations);
     let c_tol = tol_params.tolerance_for(NucleusType::C13, iteration, max_iterations);
@@ -2999,94 +3287,102 @@ fn compute_observation_pair_correlation(
         }
     };
 
-    // Extract key shifts by atom hint
-    let get_h_shift = |obs: &Observation| -> Option<f64> {
-        obs.dimensions.iter()
-            .find(|d| d.nucleus == NucleusType::H1 && d.atom_hint.as_deref() == Some("HN"))
-            .or_else(|| obs.dimensions.iter().find(|d| d.nucleus == NucleusType::H1))
-            .map(|d| d.shift)
-    };
+    // Helper functions (defined inline to avoid lifetime issues)
 
-    let get_n_shift = |obs: &Observation| -> Option<f64> {
+    // Get backbone anchor (H, N) shifts from Intra dimensions
+    fn get_backbone_anchor(obs: &Observation) -> Option<(f64, f64)> {
+        let h = obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::H1 && d.residue_offset == ResidueOffset::Intra)
+            .map(|d| d.shift)?;
+        let n = obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::N15 && d.residue_offset == ResidueOffset::Intra)
+            .map(|d| d.shift)?;
+        Some((h, n))
+    }
+
+    // Get heavy atom shift (first N15 or C13)
+    fn get_heavy_shift(obs: &Observation) -> Option<(NucleusType, f64)> {
+        obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::N15 || d.nucleus == NucleusType::C13)
+            .map(|d| (d.nucleus, d.shift))
+    }
+
+    // Check if carbon dimension is intra-residue
+    fn carbon_is_intra(obs: &Observation) -> bool {
+        obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::C13)
+            .map(|d| d.residue_offset == ResidueOffset::Intra)
+            .unwrap_or(true)
+    }
+
+    // Get proton shifts for an observation
+    fn get_proton_shifts(obs: &Observation) -> Vec<f64> {
+        obs.dimensions.iter()
+            .filter(|d| d.nucleus == NucleusType::H1)
+            .map(|d| d.shift)
+            .collect()
+    }
+
+    // Get first proton shift
+    fn get_first_proton(obs: &Observation) -> Option<f64> {
+        obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::H1)
+            .map(|d| d.shift)
+    }
+
+    // Check if observation has N15
+    fn has_n15(obs: &Observation) -> bool {
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::N15)
+    }
+
+    // Get N15 shift
+    fn get_n15_shift(obs: &Observation) -> Option<f64> {
         obs.dimensions.iter()
             .find(|d| d.nucleus == NucleusType::N15)
             .map(|d| d.shift)
-    };
+    }
 
-    let get_c_shift = |obs: &Observation| -> Option<f64> {
-        obs.dimensions.iter()
-            .find(|d| d.nucleus == NucleusType::C13)
-            .map(|d| d.shift)
-    };
+    // === PHYSICS-BASED CORRELATION LOGIC ===
 
-    // Check if this is a triple-resonance experiment (has H, N, and C dimensions)
-    let is_triple_resonance = |exp: PeakExperimentType| -> bool {
-        matches!(exp, Hnca | Hncacb | Cbcaconh | Hbhaconh | Hnco)
-    };
+    // CASE 1: Both DirectBond (HSQC-type experiments)
+    // Same anchor shift → same residue
+    if obs_a.transfer_pathway == TransferPathway::DirectBond
+       && obs_b.transfer_pathway == TransferPathway::DirectBond
+    {
+        // Get proton and heavy atom shifts
+        if let (Some(ha_h), Some(hb_h)) = (get_first_proton(obs_a), get_first_proton(obs_b)) {
+            if let Some(h_score) = shifts_match(ha_h, hb_h, h_tol) {
+                // Check heavy atom (N15 or C13)
+                let da_heavy = get_heavy_shift(obs_a);
+                let db_heavy = get_heavy_shift(obs_b);
 
-    // Determine if a triple-resonance observation is intra (i) or inter (i-1) based on intensity
-    let is_intra_residue_triple = |obs: &Observation| -> bool {
-        match obs.experiment_type {
-            Hnca => obs.intensity > 0.5,      // Strong = intra
-            Hncacb => obs.intensity > 0.0,    // Positive = intra
-            Cbcaconh => false,                // Always inter (i-1)
-            Hbhaconh => false,                // Always inter (i-1)
-            Hnco => false,                    // Shows CO(i-1)
-            _ => true,
-        }
-    };
-
-    let a_is_triple = is_triple_resonance(obs_a.experiment_type);
-    let b_is_triple = is_triple_resonance(obs_b.experiment_type);
-
-    // CASE 1: Both are triple-resonance
-    // Need to consider: same backbone vs different backbone, and intra vs inter residue
-    if a_is_triple && b_is_triple {
-        if let (Some(ha), Some(hb), Some(na), Some(nb)) =
-            (get_h_shift(obs_a), get_h_shift(obs_b), get_n_shift(obs_a), get_n_shift(obs_b))
-        {
-            let h_match = shifts_match(ha, hb, h_tol);
-            let n_match = shifts_match(na, nb, n_tol);
-
-            if h_match.is_some() && n_match.is_some() {
-                // SAME backbone anchor - but correlation depends on intra/inter status!
-                // Intra (i) observations see the residue AT this backbone
-                // Inter (i-1) observations see the residue BEFORE this backbone
-                let a_intra = is_intra_residue_triple(obs_a);
-                let b_intra = is_intra_residue_triple(obs_b);
-
-                if a_intra == b_intra {
-                    // Both intra OR both inter → observing SAME residue → correlate!
-                    let backbone_score = (h_match.unwrap() + n_match.unwrap()) / 2.0;
-                    return backbone_score;
-                } else {
-                    // One intra, one inter → different residues → don't correlate
-                    return 0.0;
+                if let (Some((nuc_a, shift_a)), Some((nuc_b, shift_b))) = (da_heavy, db_heavy) {
+                    if nuc_a == nuc_b {
+                        let tol = if nuc_a == NucleusType::N15 { n_tol } else { c_tol };
+                        if let Some(heavy_score) = shifts_match(shift_a, shift_b, tol) {
+                            return (h_score + heavy_score) / 2.0;
+                        }
+                    }
                 }
             }
         }
-        // Different backbone anchors - sequential handled separately
         return 0.0;
     }
 
-    // CASE 2: TOCSY ↔ TOCSY - require BOTH protons to match (strict spin system link)
-    // This prevents spurious correlations from single proton overlaps between different residues
-    if obs_a.experiment_type == Tocsy && obs_b.experiment_type == Tocsy {
-        let h_dims_a: Vec<f64> = obs_a.dimensions.iter()
-            .filter(|d| d.nucleus == NucleusType::H1)
-            .map(|d| d.shift)
-            .collect();
-        let h_dims_b: Vec<f64> = obs_b.dimensions.iter()
-            .filter(|d| d.nucleus == NucleusType::H1)
-            .map(|d| d.shift)
-            .collect();
+    // CASE 2: Both ThroughBond (TOCSY-type experiments)
+    // Require BOTH protons to match (strict spin system link)
+    if obs_a.transfer_pathway == TransferPathway::ThroughBond
+       && obs_b.transfer_pathway == TransferPathway::ThroughBond
+    {
+        let ha_dims = get_proton_shifts(obs_a);
+        let hb_dims = get_proton_shifts(obs_b);
 
-        if h_dims_a.len() >= 2 && h_dims_b.len() >= 2 {
-            // Check if both proton pairs match (either orientation)
-            let match_direct = shifts_match(h_dims_a[0], h_dims_b[0], h_tol)
-                .and_then(|s1| shifts_match(h_dims_a[1], h_dims_b[1], h_tol).map(|s2| (s1 + s2) / 2.0));
-            let match_flipped = shifts_match(h_dims_a[0], h_dims_b[1], h_tol)
-                .and_then(|s1| shifts_match(h_dims_a[1], h_dims_b[0], h_tol).map(|s2| (s1 + s2) / 2.0));
+        if ha_dims.len() >= 2 && hb_dims.len() >= 2 {
+            // Check both orientations
+            let match_direct = shifts_match(ha_dims[0], hb_dims[0], h_tol)
+                .and_then(|s1| shifts_match(ha_dims[1], hb_dims[1], h_tol).map(|s2| (s1 + s2) / 2.0));
+            let match_flipped = shifts_match(ha_dims[0], hb_dims[1], h_tol)
+                .and_then(|s1| shifts_match(ha_dims[1], hb_dims[0], h_tol).map(|s2| (s1 + s2) / 2.0));
 
             if let Some(score) = match_direct.or(match_flipped) {
                 return score;
@@ -3095,80 +3391,27 @@ fn compute_observation_pair_correlation(
         return 0.0;
     }
 
-    // CASE 3: HSQC ↔ TOCSY - DISABLED
-    // Single proton matching is too loose: multiple residues share similar HA/HB shifts,
-    // creating spurious correlations between different spin systems.
-    // Instead, rely on HSQC↔HSQC and TOCSY↔TOCSY correlations, plus typing factors.
-    if (obs_a.experiment_type == Hsqc15N || obs_a.experiment_type == Hsqc13C) && obs_b.experiment_type == Tocsy {
-        return 0.0;  // No direct HSQC↔TOCSY correlation
-    }
-    if obs_a.experiment_type == Tocsy && (obs_b.experiment_type == Hsqc15N || obs_b.experiment_type == Hsqc13C) {
-        return 0.0;  // No direct TOCSY↔HSQC correlation
-    }
-
-    // CASE 4: HSQC ↔ HSQC - matching anchor proton means same residue
-    if (obs_a.experiment_type == Hsqc15N || obs_a.experiment_type == Hsqc13C) &&
-       (obs_b.experiment_type == Hsqc15N || obs_b.experiment_type == Hsqc13C)
+    // CASE 3: Both BackboneSequential (triple-resonance experiments)
+    // Check if same backbone anchor AND same residue_offset on heavy atoms
+    if obs_a.transfer_pathway == TransferPathway::BackboneSequential
+       && obs_b.transfer_pathway == TransferPathway::BackboneSequential
     {
-        // 15N-HSQC to 15N-HSQC: H/N must match
-        if obs_a.experiment_type == Hsqc15N && obs_b.experiment_type == Hsqc15N {
-            if let (Some(ha), Some(hb), Some(na), Some(nb)) =
-                (get_h_shift(obs_a), get_h_shift(obs_b), get_n_shift(obs_a), get_n_shift(obs_b))
-            {
-                if let (Some(h_score), Some(n_score)) = (shifts_match(ha, hb, h_tol), shifts_match(na, nb, n_tol)) {
-                    return (h_score + n_score) / 2.0;
-                }
-            }
-            return 0.0;
-        }
+        if let (Some((ha, na)), Some((hb, nb))) = (get_backbone_anchor(obs_a), get_backbone_anchor(obs_b)) {
+            let h_match = shifts_match(ha, hb, h_tol);
+            let n_match = shifts_match(na, nb, n_tol);
 
-        // 13C-HSQC to 13C-HSQC: matching C-H pair means same atom
-        if obs_a.experiment_type == Hsqc13C && obs_b.experiment_type == Hsqc13C {
-            if let (Some(ha), Some(hb), Some(ca), Some(cb)) =
-                (get_h_shift(obs_a), get_h_shift(obs_b), get_c_shift(obs_a), get_c_shift(obs_b))
-            {
-                if let (Some(h_score), Some(c_score)) = (shifts_match(ha, hb, h_tol), shifts_match(ca, cb, c_tol)) {
-                    return (h_score + c_score) / 2.0;
-                }
-            }
-            return 0.0;
-        }
+            if h_match.is_some() && n_match.is_some() {
+                // SAME backbone anchor - but do they observe the same residue?
+                // Use residue_offset to determine this (physics-based!)
+                let a_intra = carbon_is_intra(obs_a);
+                let b_intra = carbon_is_intra(obs_b);
 
-        // 15N-HSQC to 13C-HSQC: no direct correlation (different anchor types)
-        return 0.0;
-    }
-
-    // CASE 5: Triple-resonance ↔ HSQC - if H/N matches AND triple-res shows INTRA carbon
-    // then they observe the SAME residue → full correlation
-    // If triple-res shows INTER carbon → different residue → no correlation
-    if a_is_triple && obs_b.experiment_type == Hsqc15N {
-        if let (Some(ha), Some(hb), Some(na), Some(nb)) =
-            (get_h_shift(obs_a), get_h_shift(obs_b), get_n_shift(obs_a), get_n_shift(obs_b))
-        {
-            if let (Some(h_score), Some(n_score)) = (shifts_match(ha, hb, h_tol), shifts_match(na, nb, n_tol)) {
-                // Check if triple-resonance shows intra or inter carbon
-                let is_intra = is_intra_residue_triple(obs_a);
-                if is_intra {
-                    // INTRA: both observe the same residue → full correlation
-                    return (h_score + n_score) / 2.0;
+                if a_intra == b_intra {
+                    // Both observe the same residue → correlate
+                    let backbone_score = (h_match.unwrap() + n_match.unwrap()) / 2.0;
+                    return backbone_score;
                 } else {
-                    // INTER: triple-res shows i-1 residue, HSQC shows i → no correlation
-                    return 0.0;
-                }
-            }
-        }
-        return 0.0;
-    }
-    if obs_a.experiment_type == Hsqc15N && b_is_triple {
-        // Symmetric case
-        if let (Some(ha), Some(hb), Some(na), Some(nb)) =
-            (get_h_shift(obs_a), get_h_shift(obs_b), get_n_shift(obs_a), get_n_shift(obs_b))
-        {
-            if let (Some(h_score), Some(n_score)) = (shifts_match(ha, hb, h_tol), shifts_match(na, nb, n_tol)) {
-                let is_intra = is_intra_residue_triple(obs_b);
-                if is_intra {
-                    return (h_score + n_score) / 2.0;
-                } else {
+                    // One is intra, one is inter → different residues
                     return 0.0;
                 }
             }
@@ -3176,15 +3419,55 @@ fn compute_observation_pair_correlation(
         return 0.0;
     }
 
-    // CASE 6: NOESY - sequential correlations
-    // NOESY HN(i) ↔ HA(i-1) provides sequential information, not same-residue
-    if obs_a.experiment_type == Noesy || obs_b.experiment_type == Noesy {
-        // NOESY correlations are complex - for now, only correlate with same spin system via TOCSY
-        // Direct NOESY-NOESY or NOESY-HSQC needs more careful handling
+    // CASE 4: DirectBond + BackboneSequential
+    // HSQC correlates with triple-res if anchor matches AND triple-res carbon is INTRA
+    if (obs_a.transfer_pathway == TransferPathway::DirectBond && obs_b.transfer_pathway == TransferPathway::BackboneSequential)
+       || (obs_a.transfer_pathway == TransferPathway::BackboneSequential && obs_b.transfer_pathway == TransferPathway::DirectBond)
+    {
+        let (direct_obs, sequential_obs) = if obs_a.transfer_pathway == TransferPathway::DirectBond {
+            (obs_a, obs_b)
+        } else {
+            (obs_b, obs_a)
+        };
+
+        // Check if direct observation has N15 (15N-HSQC)
+        if !has_n15(direct_obs) { return 0.0; }
+
+        // Get backbone anchor from both
+        let direct_h = get_first_proton(direct_obs);
+        let direct_n = get_n15_shift(direct_obs);
+
+        if let (Some((seq_h, seq_n)), Some(dh), Some(dn)) =
+               (get_backbone_anchor(sequential_obs), direct_h, direct_n)
+        {
+            if let (Some(h_score), Some(n_score)) = (shifts_match(dh, seq_h, h_tol), shifts_match(dn, seq_n, n_tol)) {
+                // Check if sequential observation's carbon is INTRA (same residue as HSQC)
+                if carbon_is_intra(sequential_obs) {
+                    return (h_score + n_score) / 2.0;
+                }
+            }
+        }
         return 0.0;
     }
 
-    // Default: no correlation for unhandled experiment combinations
+    // CASE 5: DirectBond + ThroughBond
+    // HSQC↔TOCSY correlation is weak (single proton match is too loose)
+    // Disabled to prevent spurious correlations
+    if (obs_a.transfer_pathway == TransferPathway::DirectBond && obs_b.transfer_pathway == TransferPathway::ThroughBond)
+       || (obs_a.transfer_pathway == TransferPathway::ThroughBond && obs_b.transfer_pathway == TransferPathway::DirectBond)
+    {
+        return 0.0;
+    }
+
+    // CASE 6: ThroughSpace (NOESY) - complex distance-dependent correlations
+    // Sequential correlations from NOESY are handled in compute_sequential_links
+    if obs_a.transfer_pathway == TransferPathway::ThroughSpace
+       || obs_b.transfer_pathway == TransferPathway::ThroughSpace
+    {
+        return 0.0;
+    }
+
+    // Default: no correlation for unhandled pathway combinations
     0.0
 }
 
@@ -3244,22 +3527,25 @@ struct SequentialLink {
     strength: f64,    // Carbon match quality (0-1)
 }
 
-/// Compute sequential relationships from triple-resonance carbon matching.
+/// Compute sequential links from backbone-sequential transfer pathway observations.
 ///
-/// The backbone walk: when CA(i) from one backbone matches CA(i-1) from another backbone,
-/// the first backbone's residue PRECEDES the second backbone's residue.
+/// Physics-based approach: uses TransferPathway and ResidueOffset instead of experiment types.
 ///
-/// Intensity encoding:
-/// - HNCA: intensity > 0.5 = intra (i), intensity <= 0.5 = inter (i-1)
-/// - HNCACB: intensity > 0 = intra (i), intensity <= 0 = inter (i-1)
-/// - CBCACONH: all are inter (i-1)
+/// Observations with BackboneSequential transfer pathway show carbon correlations to backbone NH.
+/// The carbon dimension has a ResidueOffset indicating whether it observes the anchor residue (Intra)
+/// or the preceding residue (PrecedingResidue).
+///
+/// When carbon shifts match across different backbone anchors:
+/// - Intra@backbone_A + PrecedingResidue@backbone_B → both see same residue → same-residue link
+/// - PrecedingResidue@backbone_A + Intra@backbone_B → both see same residue → same-residue link
+/// - Both Intra or both PrecedingResidue → different residues → no link
 fn compute_sequential_links(
     observations: &[Observation],
     tol_params: &NucleusToleranceParams,
     iteration: usize,
     max_iterations: usize,
 ) -> Vec<SequentialLink> {
-    use PeakExperimentType::*;
+    use crate::data::spin_system::{TransferPathway, ResidueOffset};
 
     let c_tol = tol_params.tolerance_for(NucleusType::C13, iteration, max_iterations);
     let h_tol = tol_params.tolerance_for(NucleusType::H1, iteration, max_iterations);
@@ -3267,13 +3553,8 @@ fn compute_sequential_links(
 
     let mut links = Vec::new();
 
-    // Helper to check if an observation is triple-resonance
-    let is_triple = |exp: PeakExperimentType| -> bool {
-        matches!(exp, Hnca | Hncacb | Cbcaconh)
-    };
-
     // Helper to get backbone anchor (H, N) shifts
-    let get_backbone = |obs: &Observation| -> Option<(f64, f64)> {
+    fn get_backbone(obs: &Observation) -> Option<(f64, f64)> {
         let h = obs.dimensions.iter()
             .find(|d| d.nucleus == NucleusType::H1)
             .map(|d| d.shift)?;
@@ -3281,46 +3562,35 @@ fn compute_sequential_links(
             .find(|d| d.nucleus == NucleusType::N15)
             .map(|d| d.shift)?;
         Some((h, n))
-    };
+    }
 
-    // Helper to get carbon shift
-    let get_carbon = |obs: &Observation| -> Option<f64> {
+    // Helper to get carbon shift and its residue offset (physics-based!)
+    fn get_carbon_with_offset(obs: &Observation) -> Option<(f64, ResidueOffset)> {
         obs.dimensions.iter()
             .find(|d| d.nucleus == NucleusType::C13)
-            .map(|d| d.shift)
-    };
-
-    // Helper to determine if this is an intra-residue (i) or inter-residue (i-1) carbon
-    let is_intra_residue = |obs: &Observation| -> bool {
-        match obs.experiment_type {
-            Hnca => obs.intensity > 0.5,      // Strong = intra
-            Hncacb => obs.intensity > 0.0,    // Positive = intra
-            Cbcaconh => false,                // Always inter (i-1)
-            _ => true,                         // Default to intra
-        }
-    };
+            .map(|d| (d.shift, d.residue_offset))
+    }
 
     // Helper to check if two backbones are different (not the same NH)
     let different_backbone = |h1: f64, n1: f64, h2: f64, n2: f64| -> bool {
         (h1 - h2).abs() > h_tol || (n1 - n2).abs() > n_tol
     };
 
-    // Find all triple-resonance observations
-    let triple_obs: Vec<(usize, &Observation)> = observations.iter()
+    // Find all backbone-sequential observations (HNCA, HNCACB, CBCACONH, etc.)
+    // Physics-based: filter by transfer pathway, NOT experiment type!
+    let sequential_obs: Vec<(usize, &Observation)> = observations.iter()
         .enumerate()
-        .filter(|(_, obs)| is_triple(obs.experiment_type))
+        .filter(|(_, obs)| obs.transfer_pathway == TransferPathway::BackboneSequential)
         .collect();
 
-    // For each pair of triple-resonance observations at DIFFERENT backbones
-    for (i, (idx_a, obs_a)) in triple_obs.iter().enumerate() {
+    // For each pair of backbone-sequential observations at DIFFERENT backbones
+    for (i, (idx_a, obs_a)) in sequential_obs.iter().enumerate() {
         let Some((h_a, n_a)) = get_backbone(obs_a) else { continue };
-        let Some(c_a) = get_carbon(obs_a) else { continue };
-        let is_intra_a = is_intra_residue(obs_a);
+        let Some((c_a, offset_a)) = get_carbon_with_offset(obs_a) else { continue };
 
-        for (idx_b, obs_b) in triple_obs.iter().skip(i + 1) {
+        for (idx_b, obs_b) in sequential_obs.iter().skip(i + 1) {
             let Some((h_b, n_b)) = get_backbone(obs_b) else { continue };
-            let Some(c_b) = get_carbon(obs_b) else { continue };
-            let is_intra_b = is_intra_residue(obs_b);
+            let Some((c_b, offset_b)) = get_carbon_with_offset(obs_b) else { continue };
 
             // Skip if same backbone anchor
             if !different_backbone(h_a, n_a, h_b, n_b) {
@@ -3334,37 +3604,37 @@ fn compute_sequential_links(
             }
 
             // Carbon match found at DIFFERENT backbones!
-            // Key insight:
+            // Use physics-based residue_offset instead of experiment-type dispatch:
             //   - Intra@backbone_X sees residue X
-            //   - Inter@backbone_Y sees residue Y-1
+            //   - PrecedingResidue@backbone_Y sees residue Y-1
             // If carbons match: the residues they observe are the SAME
-            //   - If A intra@X and B inter@Y match: residue X = residue Y-1
+            //   - If A Intra@X and B PrecedingResidue@Y match: residue X = residue Y-1
             //     → A and B observe the SAME residue (NOT sequential!)
             //     → We learn backbone X+1 = backbone Y (backbone ordering)
-            //   - If A inter@X and B intra@Y match: residue X-1 = residue Y
+            //   - If A PrecedingResidue@X and B Intra@Y match: residue X-1 = residue Y
             //     → A and B observe the SAME residue
             //     → We learn backbone X = backbone Y+1
             //
             // So cross-backbone intra/inter carbon matches are SAME-RESIDUE correlations,
-            // not sequential relationships! True sequential would be:
-            //   - Intra@X matching Intra@Y where X precedes Y in backbone order
-            //     → residue X precedes residue Y
+            // not sequential relationships!
 
             let match_strength = (-0.5 * (c_diff / c_tol).powi(2)).exp();
 
+            let is_intra_a = offset_a == ResidueOffset::Intra;
+            let is_intra_b = offset_b == ResidueOffset::Intra;
+
             if is_intra_a && !is_intra_b {
-                // A shows intra (residue at backbone A), B shows inter (residue at backbone B - 1)
+                // A shows Intra (residue at backbone A), B shows PrecedingResidue (residue at backbone B - 1)
                 // Match means: residue(A) = residue(B-1)
                 // KEY INSIGHT: Both observations see the SAME RESIDUE!
                 // This is a SAME-RESIDUE correlation, not a sequential position shift!
-                // (The backbone ordering info should be used elsewhere)
                 links.push(SequentialLink {
                     from_idx: *idx_a,
                     to_idx: *idx_b,
                     strength: -match_strength,  // NEGATIVE = same-residue (both at same position)
                 });
             } else if !is_intra_a && is_intra_b {
-                // A shows inter (residue at backbone A - 1), B shows intra (residue at backbone B)
+                // A shows PrecedingResidue (residue at backbone A - 1), B shows Intra (residue at backbone B)
                 // Match means: residue(A-1) = residue(B)
                 // Both observe the SAME RESIDUE
                 links.push(SequentialLink {
@@ -3373,25 +3643,29 @@ fn compute_sequential_links(
                     strength: -match_strength,  // NEGATIVE = same-residue
                 });
             }
-            // Both intra or both inter: they observe different residues, skip
+            // Both Intra or both PrecedingResidue: they observe different residues, skip
         }
     }
 
     if iteration == 0 && !links.is_empty() {
-        println!("Sequential links: {} found from triple-resonance carbon matching", links.len());
-        // Debug: show what links we found
+        println!("Sequential links: {} found from backbone-sequential carbon matching", links.len());
+        // Debug: show what links we found (physics-based: show residue_offset)
         for link in &links {
             let obs_from = &observations[link.from_idx];
             let obs_to = &observations[link.to_idx];
-            let from_c = obs_from.dimensions.iter().find(|d| d.nucleus == NucleusType::C13).map(|d| d.shift);
-            let to_c = obs_to.dimensions.iter().find(|d| d.nucleus == NucleusType::C13).map(|d| d.shift);
+            let from_carbon = obs_from.dimensions.iter().find(|d| d.nucleus == NucleusType::C13);
+            let to_carbon = obs_to.dimensions.iter().find(|d| d.nucleus == NucleusType::C13);
             let from_h = obs_from.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift);
             let from_n = obs_from.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift);
             let to_h = obs_to.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift);
             let to_n = obs_to.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift);
             println!("  Link: BB(H={:.2},N={:.1}) C={:.1} {:?} -> BB(H={:.2},N={:.1}) C={:.1} {:?} str={:.2}",
-                from_h.unwrap_or(0.0), from_n.unwrap_or(0.0), from_c.unwrap_or(0.0), obs_from.experiment_type,
-                to_h.unwrap_or(0.0), to_n.unwrap_or(0.0), to_c.unwrap_or(0.0), obs_to.experiment_type,
+                from_h.unwrap_or(0.0), from_n.unwrap_or(0.0),
+                from_carbon.map(|d| d.shift).unwrap_or(0.0),
+                from_carbon.map(|d| d.residue_offset),
+                to_h.unwrap_or(0.0), to_n.unwrap_or(0.0),
+                to_carbon.map(|d| d.shift).unwrap_or(0.0),
+                to_carbon.map(|d| d.residue_offset),
                 link.strength);
         }
     }

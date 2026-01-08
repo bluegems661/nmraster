@@ -2211,8 +2211,9 @@ fn print_chemical_shift_table(
             '?'
         };
 
-        // Look up assigned shift
-        let assigned = assigned_shifts.get(&(*residue, atom_name.clone())).copied();
+        // Look up assigned shift (normalize atom name since assigned_shifts uses normalized names)
+        let normalized_atom = normalize_stereo_atoms(atom_name);
+        let assigned = assigned_shifts.get(&(*residue, normalized_atom)).copied();
 
         // Add separator line between residues
         if *residue != current_res && current_res > 0 {
