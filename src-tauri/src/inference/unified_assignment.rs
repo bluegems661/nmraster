@@ -199,10 +199,12 @@ impl Observation {
                         shift: peak.position_ppm[0],
                         atom_hint: None,
                         residue_offset: ResidueOffset::Intra,
-                        // Could be any aliphatic carbon
+                        // Could be any aliphatic or aromatic carbon
                         atom_constraint: AtomConstraint::OneOf(vec![
                             "CA".into(), "CB".into(), "CG".into(), "CG1".into(), "CG2".into(),
-                            "CD".into(), "CD1".into(), "CD2".into(), "CE".into(), "CE1".into(), "CE2".into(),
+                            "CD".into(), "CD1".into(), "CD2".into(),
+                            "CE".into(), "CE1".into(), "CE2".into(), "CE3".into(),
+                            "CZ".into(), "CZ2".into(), "CZ3".into(), "CH2".into(),
                         ]),
                     },
                     ObservedDimension {
@@ -3311,6 +3313,7 @@ fn atoms_from_constraint(constraint: &crate::data::spin_system::AtomConstraint, 
             let mut result = Vec::new();
             for atom in atoms {
                 match atom.as_str() {
+                    // Backbone
                     "CA" => result.push("CA"),
                     "CB" => result.push("CB"),
                     "H" | "HN" => result.push("H"),
@@ -3321,6 +3324,21 @@ fn atoms_from_constraint(constraint: &crate::data::spin_system::AtomConstraint, 
                     }
                     "N" => result.push("N"),
                     "C" => result.push("C"),
+                    // Sidechain carbons (aliphatic + aromatic)
+                    "CG" => result.push("CG"),
+                    "CG1" => result.push("CG1"),
+                    "CG2" => result.push("CG2"),
+                    "CD" => result.push("CD"),
+                    "CD1" => result.push("CD1"),
+                    "CD2" => result.push("CD2"),
+                    "CE" => result.push("CE"),
+                    "CE1" => result.push("CE1"),
+                    "CE2" => result.push("CE2"),
+                    "CE3" => result.push("CE3"),
+                    "CZ" => result.push("CZ"),
+                    "CZ2" => result.push("CZ2"),
+                    "CZ3" => result.push("CZ3"),
+                    "CH2" => result.push("CH2"),
                     _ => {}
                 }
             }

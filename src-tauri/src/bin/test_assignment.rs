@@ -1364,12 +1364,18 @@ fn generate_synthetic_peaks(
         // 15N-HSQC: backbone H-N (skip proline, skip position 1 for N-terminus)
         if one_letter != 'P' && i > 0 {
             if let (Some(h), Some(n)) = (h_mode, n_mode) {
-                // Record expected shifts for atom-centric table
-                ground_truth.set_expected_shift(seq_code, "H", h);
-                ground_truth.set_expected_shift(seq_code, "N", n);
-
                 let h_shift = add_noise(h, 0.5, &mut rng);
                 let n_shift = add_noise(n, 4.0, &mut rng);
+
+                // Record expected shifts only for experiments that can observe them
+                // N is only observable via 15N-HSQC
+                if filter.should_include("15n-hsqc") {
+                    ground_truth.set_expected_shift(seq_code, "N", n);
+                }
+                // H (amide) is observable via 15N-HSQC or TOCSY
+                if filter.should_include("15n-hsqc") || filter.should_include("tocsy") {
+                    ground_truth.set_expected_shift(seq_code, "H", h);
+                }
 
                 if filter.should_include("15n-hsqc") {
                     let peak = UnlabeledPeak::hsqc_15n(n_shift, h_shift, 1.0);
@@ -1381,11 +1387,16 @@ fn generate_synthetic_peaks(
                     hsqc_15n.push(peak);
                 }
 
+                // Store shifts for sequential experiments (NOESY, triple-resonance)
                 h_shifts.insert(seq_code, h_shift);
                 n_shifts.insert(seq_code, n_shift);
                 h_refs.insert(seq_code, h);  // KDE mode reference
                 n_refs.insert(seq_code, n);  // KDE mode reference
-                residue_protons.push(("H".to_string(), h_shift, h));  // (name, observed, reference)
+
+                // Add H to residue protons for TOCSY if TOCSY is included
+                if filter.should_include("tocsy") {
+                    residue_protons.push(("H".to_string(), h_shift, h));
+                }
             }
         }
 
@@ -2220,11 +2231,19 @@ fn print_chemical_shift_table(
                     // Map nucleus name to atom name based on context
                     let atom_name = map_nucleus_to_atom(nucleus_name, atom_desc);
 
-                    // Skip backbone H/N from non-backbone experiments
-                    // (They might be from a different residue in sequential experiments)
-                    if (atom_name == "H" || atom_name == "N") &&
-                       result.experiment_type != nmraster_lib::data::spin_system::PeakExperimentType::Hsqc15N {
-                        continue;
+                    // Skip backbone H/N from sequential experiments where they belong to
+                    // residue i but the observation is assigned to residue i-1.
+                    // TOCSY, HNCA, HNCACB etc. have H/N from the same residue, so allow them.
+                    if (atom_name == "H" || atom_name == "N") {
+                        use nmraster_lib::data::spin_system::PeakExperimentType;
+                        let is_sequential_inter = matches!(result.experiment_type,
+                            PeakExperimentType::Cbcaconh |
+                            PeakExperimentType::Hbhaconh |
+                            PeakExperimentType::Hnco
+                        );
+                        if is_sequential_inter {
+                            continue;
+                        }
                     }
 
                     // Skip TOCSY-derived protons (H_tocsy, H_ali) for shift table
