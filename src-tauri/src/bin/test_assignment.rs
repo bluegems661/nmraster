@@ -11,9 +11,24 @@
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
+
+// ANSI color codes for terminal output
+mod colors {
+    pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const RED: &str = "\x1b[31m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const CYAN: &str = "\x1b[36m";
+    pub const WHITE: &str = "\x1b[37m";
+    pub const BG_GREEN: &str = "\x1b[42m";
+    pub const BG_RED: &str = "\x1b[41m";
+}
 
 use nmraster_lib::data::spin_system::UnlabeledPeak;
 use nmraster_lib::inference::{
@@ -688,6 +703,26 @@ fn run_synthetic_mode(sequence: &str, noise: f64, verbose: bool, filter: &Experi
             observations.push(obs);
         }
     }
+    for peak in &hnco {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hbhaconh {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hsqc_tocsy_15n_3d {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hsqc_tocsy_13c_3d {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
 
     println!("Total observations: {}", observations.len());
 
@@ -1129,17 +1164,18 @@ fn generate_peaks_from_bmrb(
             }
         }
 
-        // HBHACONH: (H, N, HA/HB) - only i-1 protons
-        // Ground truth: ALL peaks show previous residue's protons
+        // HBHACONH: (H, N, HA/HB) - backbone H/N from residue i, sidechain H from i-1
+        // Ground truth: Register with curr_seq (backbone anchor residue)
+        // The algorithm assigns based on backbone H/N matching
         if filter.should_include("hbhaconh") {
             if let Some(ha) = ha_prev {
                 let peak = UnlabeledPeak::hbhaconh(h_val, n_val, ha, 1.0);
-                ground_truth.register(&peak, curr_seq - 1, "H/N/HA(i-1)");
+                ground_truth.register(&peak, curr_seq, "H/N/HA(i-1)");
                 hbhaconh.push(peak);
             }
             if let Some(hb) = hb_prev {
                 let peak = UnlabeledPeak::hbhaconh(h_val, n_val, hb, 0.8);
-                ground_truth.register(&peak, curr_seq - 1, "H/N/HB(i-1)");
+                ground_truth.register(&peak, curr_seq, "H/N/HB(i-1)");
                 hbhaconh.push(peak);
             }
         }
@@ -1979,213 +2015,166 @@ fn print_data_density(shifts: &[DepositedShift], sequence: &str) {
     println!();
 }
 
-/// Print results table and summary
+/// Print results table and summary - industrial standard format
 fn print_results(summary: &TestSummary, sequence: &str, mode_desc: &str) {
-    let width = 79;
-
-    println!();
-    println!("{}", "=".repeat(width));
-    println!("{:^width$}", "UNIFIED ASSIGNMENT TEST RESULTS");
-    println!("{}", "=".repeat(width));
-    println!();
-    println!("Sequence: {} ({} residues)", sequence, sequence.len());
-    println!("Mode: {}", mode_desc);
-    println!();
-    println!("{}", "-".repeat(width));
-    println!(
-        " {:8} | {:4} | {:9} | {:6} | {:5} | {:10} | {:8}",
-        "Peak ID", "Type", "Predicted", "Actual", "Match", "Confidence", "Atom"
-    );
-    println!("{}", "-".repeat(width));
-
-    for result in &summary.results {
-        let type_str = match result.peak_type {
-            PeakType::Backbone => "BB",
-            PeakType::Carbon => "C",
-        };
-
-        let match_str = if result.is_correct { "OK" } else { "MISS" };
-
-        println!(
-            " {:8} | {:4} | {:9} | {:6} | {:5} | {:9.1}% | {:8}",
-            &result.peak_id.to_string()[..8],
-            type_str,
-            result.predicted_residue,
-            result.actual_residue,
-            match_str,
-            result.confidence * 100.0,
-            result.atom_name
-        );
-    }
-
-    println!("{}", "-".repeat(width));
-    println!();
-    println!("SUMMARY:");
-    println!("  Total peaks:       {}", summary.total_peaks);
-    println!("  Correct:           {}", summary.correct);
+    use colors::*;
 
     let overall_acc = if summary.total_peaks > 0 {
         (summary.correct as f64 / summary.total_peaks as f64) * 100.0
     } else {
         0.0
     };
-    println!("  Overall accuracy:  {:.1}%", overall_acc);
-
-    println!();
-    println!("  Backbone peaks:    {}", summary.backbone_peaks);
-    println!("  Backbone correct:  {}", summary.backbone_correct);
 
     let bb_acc = if summary.backbone_peaks > 0 {
         (summary.backbone_correct as f64 / summary.backbone_peaks as f64) * 100.0
     } else {
         0.0
     };
-    println!("  Backbone accuracy: {:.1}%", bb_acc);
 
-    // Per amino acid breakdown
+    // Header
+    println!();
+    println!("{}{}  NMR ASSIGNMENT RESULTS  {}", BOLD, CYAN, RESET);
+    println!("{}", "─".repeat(60));
+    println!();
+
+    // Sequence info
+    println!("{}Sequence:{} {} ({} residues)", BOLD, RESET, sequence, sequence.len());
+    println!("{}Mode:{}     {}", BOLD, RESET, mode_desc);
+    println!();
+
+    // Main accuracy display - big and bold
+    let acc_color = if overall_acc >= 95.0 { GREEN } else if overall_acc >= 80.0 { YELLOW } else { RED };
+    let bb_color = if bb_acc >= 95.0 { GREEN } else if bb_acc >= 80.0 { YELLOW } else { RED };
+
+    println!("{}┌─────────────────────────────────────────────────────────┐{}", DIM, RESET);
+    println!("{}│{}  {}PEAK ASSIGNMENT{}                                          {}│{}",
+             DIM, RESET, BOLD, RESET, DIM, RESET);
+    println!("{}│{}  Accuracy: {}{:>6.1}%{}  ({}/{} peaks)                      {}│{}",
+             DIM, RESET, acc_color, overall_acc, RESET, summary.correct, summary.total_peaks, DIM, RESET);
+    println!("{}│{}                                                           {}│{}", DIM, RESET, DIM, RESET);
+    println!("{}│{}  {}BACKBONE (15N-HSQC){}                                       {}│{}",
+             DIM, RESET, BOLD, RESET, DIM, RESET);
+    println!("{}│{}  Accuracy: {}{:>6.1}%{}  ({}/{} peaks)                        {}│{}",
+             DIM, RESET, bb_color, bb_acc, RESET, summary.backbone_correct, summary.backbone_peaks, DIM, RESET);
+    println!("{}└─────────────────────────────────────────────────────────┘{}", DIM, RESET);
+    println!();
+
+    // Per-residue summary (compact)
     if !summary.per_aa.is_empty() {
+        println!("{}Per-Residue Breakdown:{}", BOLD, RESET);
         println!();
-        println!("PER AMINO ACID:");
-        println!("  {:3} | {:5} | {:7} | {:8}", "AA", "Total", "Correct", "Accuracy");
-        println!("  {}", "-".repeat(35));
 
-        // Sort by accuracy (worst first) to highlight problematic AAs
+        // Sort by position in sequence
+        let seq_chars: Vec<char> = sequence.chars().collect();
         let mut aa_list: Vec<_> = summary.per_aa.iter().collect();
-        aa_list.sort_by(|a, b| {
-            let acc_a = if a.1.total > 0 { a.1.correct as f64 / a.1.total as f64 } else { 0.0 };
-            let acc_b = if b.1.total > 0 { b.1.correct as f64 / b.1.total as f64 } else { 0.0 };
-            acc_a.partial_cmp(&acc_b).unwrap()
+        aa_list.sort_by_key(|(aa, _)| {
+            seq_chars.iter().position(|c| c == *aa).unwrap_or(99)
         });
 
-        for (aa, stats) in aa_list {
+        // Print compact table
+        print!("  ");
+        for (aa, _) in &aa_list {
+            print!(" {:^5}", aa);
+        }
+        println!();
+
+        print!("  ");
+        for (_, stats) in &aa_list {
             let acc = if stats.total > 0 {
                 (stats.correct as f64 / stats.total as f64) * 100.0
             } else {
                 0.0
             };
-            let marker = if acc < 50.0 { " !" } else { "" };
-            println!("  {:3} | {:5} | {:7} | {:6.1}%{}", aa, stats.total, stats.correct, acc, marker);
+            let color = if acc >= 95.0 { GREEN } else if acc >= 80.0 { YELLOW } else { RED };
+            print!(" {}{:>4.0}%{}", color, acc, RESET);
         }
+        println!();
+        println!();
     }
-    println!();
-
-    // Print atom-centric table at the end
-    print_atom_table(summary, sequence);
 }
 
-/// Print atom-centric results table organized by residue
-fn print_atom_table(summary: &TestSummary, sequence: &str) {
-    let seq_chars: Vec<char> = sequence.chars().collect();
-    let width = 105;
-
-    println!("{}", "=".repeat(width));
-    println!("{:^width$}", "ATOM-BY-ATOM ASSIGNMENT TABLE");
-    println!("{}", "=".repeat(width));
-    println!();
-    println!(
-        " {:3} | {:3} | {:14} | {:>18} | {:>18} | {:>8} | {:6}",
-        "Res", "AA", "Atom", "Observed", "Reference", "Assigned", "Match"
-    );
-    println!("{}", "-".repeat(width));
-
-    // Group results by actual residue
-    let mut by_residue: HashMap<i32, Vec<&PeakResult>> = HashMap::new();
-    for result in &summary.results {
-        by_residue
-            .entry(result.actual_residue)
-            .or_default()
-            .push(result);
-    }
-
-    // Print in residue order
-    let mut residues: Vec<_> = by_residue.keys().copied().collect();
-    residues.sort();
-
-    for res in residues {
-        let results = &by_residue[&res];
-        let aa = if res > 0 && (res as usize) <= seq_chars.len() {
-            seq_chars[res as usize - 1]
-        } else {
-            '?'
-        };
-
-        // Sort by atom name within each residue
-        let mut sorted_results: Vec<_> = results.iter().copied().collect();
-        sorted_results.sort_by(|a, b| a.atom_name.cmp(&b.atom_name));
-
-        for result in sorted_results {
-            let match_str = if result.is_correct { "OK" } else { "MISS" };
-
-            // Format observed shifts - show key shift (last one is usually most distinctive)
-            let observed_str = format_key_shift(&result.shifts);
-
-            // Format reference shifts
-            let reference_str = if result.reference_shifts.is_empty() {
-                "-".to_string()
-            } else {
-                format_key_shift(&result.reference_shifts)
-            };
-
-            println!(
-                " {:3} | {:3} | {:14} | {:>18} | {:>18} | {:>8} | {:6}",
-                res,
-                aa,
-                result.atom_name,
-                observed_str,
-                reference_str,
-                result.predicted_residue,
-                match_str
-            );
-        }
-    }
-
-    println!("{}", "-".repeat(width));
-    println!();
-}
+// Note: print_atom_table was removed - using print_chemical_shift_table instead
+// for industrial-standard output format
 
 /// Print chemical shift table: for each atom position, show expected vs assigned shift
-/// This is the user's desired format - atom-centric, not peak-centric
+/// Industrial-standard format with clear visual hierarchy
 fn print_chemical_shift_table(
     results: &[ObservationAssignmentResult],
     ground_truth: &GroundTruth,
     sequence: &str,
 ) {
-    let seq_chars: Vec<char> = sequence.chars().collect();
-    let width = 80;
+    use colors::*;
 
-    println!();
-    println!("{}", "=".repeat(width));
-    println!("{:^width$}", "CHEMICAL SHIFT TABLE (Expected vs Assigned)");
-    println!("{}", "=".repeat(width));
-    println!();
-    println!(
-        " {:3} | {:3} | {:6} | {:>10} | {:>10} | {:>8} | {}",
-        "Res", "AA", "Atom", "Expected", "Assigned", "Delta", "Match"
-    );
-    println!("{}", "-".repeat(width));
+    let seq_chars: Vec<char> = sequence.chars().collect();
 
     // Build a map: for each (residue, atom_name) -> assigned shift value
     // We find this by looking at peaks that were assigned to each residue
     // and matching their atom types
-    let mut assigned_shifts: HashMap<(i32, String), f64> = HashMap::new();
+    //
+    // IMPORTANT: Use a priority system to handle overlapping assignments:
+    // - Backbone H/N: Only from 15N-HSQC (experiment_type == Hsqc15N)
+    // - Sidechain atoms: From appropriate experiments
+    //
+    // Sequential experiments (HBHACONH, CBCACONH, HNCO) have backbone H/N from
+    // residue i but are assigned to residue i-1 - we must NOT use their H/N values.
 
+    let mut assigned_shifts: HashMap<(i32, String), f64> = HashMap::new();
+    let mut backbone_assigned: HashSet<i32> = HashSet::new(); // Track which residues have backbone H/N
+
+    // First pass: Process backbone-only experiments (15N-HSQC) first
     for result in results {
         let assigned_res = result.assigned_residue;
         if assigned_res <= 0 {
-            continue; // Unassigned
+            continue;
+        }
+
+        // Only process 15N-HSQC for backbone H/N
+        if result.experiment_type == nmraster_lib::data::spin_system::PeakExperimentType::Hsqc15N {
+            if let Some(shifts) = ground_truth.peak_to_shifts.get(&result.observation_id) {
+                for (nucleus_name, shift_val) in shifts {
+                    let atom_name = match nucleus_name.as_str() {
+                        "H" | "HN" => "H".to_string(),
+                        "N" | "N15" => "N".to_string(),
+                        _ => continue,
+                    };
+                    assigned_shifts.insert((assigned_res, atom_name), *shift_val);
+                }
+                backbone_assigned.insert(assigned_res);
+            }
+        }
+    }
+
+    // Second pass: Process all other experiments for sidechain atoms
+    for result in results {
+        let assigned_res = result.assigned_residue;
+        if assigned_res <= 0 {
+            continue;
         }
 
         // Get the atom name for this peak
         if let Some(atom_desc) = ground_truth.peak_to_atom.get(&result.observation_id) {
             // Get the shifts from this peak
             if let Some(shifts) = ground_truth.peak_to_shifts.get(&result.observation_id) {
-                // Parse atom description like "H/N", "CA/HA", or just "H1/H2" for TOCSY
                 for (nucleus_name, shift_val) in shifts {
                     // Map nucleus name to atom name based on context
                     let atom_name = map_nucleus_to_atom(nucleus_name, atom_desc);
+
+                    // Skip backbone H/N from non-backbone experiments
+                    // (They might be from a different residue in sequential experiments)
+                    if (atom_name == "H" || atom_name == "N") &&
+                       result.experiment_type != nmraster_lib::data::spin_system::PeakExperimentType::Hsqc15N {
+                        continue;
+                    }
+
+                    // Skip TOCSY-derived protons (H_tocsy, H_ali) for shift table
+                    // These are correlation protons, not direct measurements
+                    if atom_name.starts_with("H_") {
+                        continue;
+                    }
+
                     let key = (assigned_res, atom_name);
-                    // Store the shift (if multiple peaks assign same atom, last wins)
-                    assigned_shifts.insert(key, *shift_val);
+                    // Only insert if not already assigned (first wins for sidechain)
+                    assigned_shifts.entry(key).or_insert(*shift_val);
                 }
             }
         }
@@ -2201,61 +2190,118 @@ fn print_chemical_shift_table(
     let mut correct_atoms = 0;
     let mut current_res = -1;
 
+    // Collect results for display
+    struct AtomResult {
+        residue: i32,
+        aa: char,
+        atom_name: String,
+        expected: f64,
+        assigned: Option<f64>,
+        delta: Option<f64>,
+        is_match: bool,
+    }
+    let mut results_by_residue: HashMap<i32, Vec<AtomResult>> = HashMap::new();
+
     for (residue, atom_name) in atoms {
         let expected = ground_truth.expected_atom_shifts.get(&(*residue, atom_name.clone())).copied().unwrap_or(0.0);
 
-        // Get amino acid
         let aa = if *residue > 0 && (*residue as usize) <= seq_chars.len() {
             seq_chars[*residue as usize - 1]
         } else {
             '?'
         };
 
-        // Look up assigned shift (normalize atom name since assigned_shifts uses normalized names)
-        let normalized_atom = normalize_stereo_atoms(atom_name);
-        let assigned = assigned_shifts.get(&(*residue, normalized_atom)).copied();
-
-        // Add separator line between residues
-        if *residue != current_res && current_res > 0 {
-            println!("{}", "-".repeat(width));
-        }
-        current_res = *residue;
+        let assigned = assigned_shifts.get(&(*residue, atom_name.clone())).copied()
+            .or_else(|| {
+                let normalized = normalize_stereo_atoms(atom_name);
+                assigned_shifts.get(&(*residue, normalized)).copied()
+            });
 
         total_atoms += 1;
 
-        if let Some(assigned_val) = assigned {
-            let delta = (assigned_val - expected).abs();
-            // Tolerance depends on nucleus type
+        let (delta, is_match) = if let Some(assigned_val) = assigned {
+            let d = (assigned_val - expected).abs();
             let tolerance = if atom_name.starts_with('H') { 0.1 } else if atom_name.starts_with('N') { 1.0 } else { 1.0 };
-            let is_match = delta < tolerance;
-            if is_match {
-                correct_atoms += 1;
-            }
-            let match_str = if is_match { "OK" } else { "MISS" };
-
-            println!(
-                " {:3} | {:3} | {:6} | {:>10.3} | {:>10.3} | {:>8.3} | {}",
-                residue, aa, atom_name, expected, assigned_val, delta, match_str
-            );
+            let m = d < tolerance;
+            if m { correct_atoms += 1; }
+            (Some(d), m)
         } else {
-            // No assignment found for this atom
-            println!(
-                " {:3} | {:3} | {:6} | {:>10.3} | {:>10} | {:>8} | {}",
-                residue, aa, atom_name, expected, "-", "-", "MISS"
-            );
-        }
+            (None, false)
+        };
+
+        results_by_residue.entry(*residue).or_default().push(AtomResult {
+            residue: *residue,
+            aa,
+            atom_name: atom_name.clone(),
+            expected,
+            assigned,
+            delta,
+            is_match,
+        });
     }
 
-    println!("{}", "-".repeat(width));
+    // Print header
+    println!();
+    println!("{}{}  CHEMICAL SHIFT TABLE  {}", BOLD, CYAN, RESET);
+    println!("{}", "─".repeat(72));
     println!();
 
-    // Summary
+    // Calculate accuracy first
     let accuracy = if total_atoms > 0 {
         100.0 * correct_atoms as f64 / total_atoms as f64
     } else {
         0.0
     };
-    println!("Atom-level accuracy: {}/{} ({:.1}%)", correct_atoms, total_atoms, accuracy);
+
+    // Print accuracy summary first (most important info)
+    let acc_color = if accuracy >= 95.0 { GREEN } else if accuracy >= 80.0 { YELLOW } else { RED };
+    println!("  {}Atom-Level Accuracy:{} {}{:.1}%{} ({}/{} atoms)",
+             BOLD, RESET, acc_color, accuracy, RESET, correct_atoms, total_atoms);
+    println!();
+
+    // Table header
+    println!("  {:>3} {:3}  {:6}   {:>8}   {:>8}   {:>6}  {}",
+             "Res", "AA", "Atom", "Expected", "Assigned", "Delta", "");
+    println!("  {}", "─".repeat(66));
+
+    // Print residues
+    let mut residues: Vec<_> = results_by_residue.keys().copied().collect();
+    residues.sort();
+
+    for res in residues {
+        let results = &results_by_residue[&res];
+        let aa = results.first().map(|r| r.aa).unwrap_or('?');
+
+        // Count correct/total for this residue
+        let res_total = results.len();
+        let res_correct = results.iter().filter(|r| r.is_match).count();
+        let res_acc = if res_total > 0 { 100.0 * res_correct as f64 / res_total as f64 } else { 0.0 };
+        let res_color = if res_acc >= 95.0 { GREEN } else if res_acc >= 80.0 { YELLOW } else { RED };
+
+        // Residue header with summary
+        println!("  {}{:>3} {:3}{} {:>52} {}{:>3}/{}{}{}",
+                 BOLD, res, aa, RESET, "", res_color, res_correct, res_total, RESET, "");
+
+        // Print each atom
+        for result in results {
+            let match_indicator = if result.is_match {
+                format!("{}OK{}", GREEN, RESET)
+            } else {
+                format!("{}MISS{}", RED, RESET)
+            };
+
+            let (assigned_str, delta_str) = if let (Some(a), Some(d)) = (result.assigned, result.delta) {
+                (format!("{:>8.3}", a), format!("{:>6.3}", d))
+            } else {
+                (format!("{:>8}", "-"), format!("{:>6}", "-"))
+            };
+
+            println!("          {:6}   {:>8.3}   {}   {}  {}",
+                     result.atom_name, result.expected, assigned_str, delta_str, match_indicator);
+        }
+    }
+
+    println!("  {}", "─".repeat(66));
     println!();
 }
 
@@ -2326,37 +2372,7 @@ fn atom_sort_key(atom: &str) -> (u8, String) {
     (order, atom.to_string())
 }
 
-/// Format key shifts for display (show most distinctive ones)
-fn format_key_shift(shifts: &[(String, f64)]) -> String {
-    if shifts.is_empty() {
-        return "-".to_string();
-    }
-
-    // For 2D experiments, show both
-    // For 3D experiments, focus on key nuclei (C, N rather than H)
-    let key_shifts: Vec<_> = shifts.iter()
-        .filter(|(name, _)| {
-            // Prioritize carbon and nitrogen shifts (more distinctive)
-            name.starts_with('C') || name.starts_with('N') ||
-            name == "H" || name == "H1" || name == "H2"
-        })
-        .take(3)  // Max 3 shifts to fit
-        .collect();
-
-    if key_shifts.is_empty() {
-        // Fallback to first shifts
-        shifts.iter()
-            .take(2)
-            .map(|(name, val)| format!("{}={:.1}", name, val))
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        key_shifts.iter()
-            .map(|(name, val)| format!("{}={:.1}", name, val))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
+// Removed: format_key_shift - was used by old print_atom_table
 
 /// Build JSON output from test results
 fn build_json_output(

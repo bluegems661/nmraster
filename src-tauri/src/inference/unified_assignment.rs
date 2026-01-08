@@ -3246,11 +3246,12 @@ fn compute_observation_correlations(
         }
     }
 
-    // Debug: report correlation discovery on first iteration
-    if iteration == 0 {
-        println!("Correlation matrix: {} observations, {} nonzero correlations (of {} possible pairs)",
-                 n, nonzero_count, n * (n - 1) / 2);
-    }
+    // Debug: correlation discovery stats (verbose mode only, see main output)
+    // Keeping for debugging if needed:
+    // if iteration == 0 {
+    //     println!("Correlation matrix: {} observations, {} nonzero correlations (of {} possible pairs)",
+    //              n, nonzero_count, n * (n - 1) / 2);
+    // }
 
     correlations
 }
@@ -3647,28 +3648,10 @@ fn compute_sequential_links(
         }
     }
 
-    if iteration == 0 && !links.is_empty() {
-        println!("Sequential links: {} found from backbone-sequential carbon matching", links.len());
-        // Debug: show what links we found (physics-based: show residue_offset)
-        for link in &links {
-            let obs_from = &observations[link.from_idx];
-            let obs_to = &observations[link.to_idx];
-            let from_carbon = obs_from.dimensions.iter().find(|d| d.nucleus == NucleusType::C13);
-            let to_carbon = obs_to.dimensions.iter().find(|d| d.nucleus == NucleusType::C13);
-            let from_h = obs_from.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift);
-            let from_n = obs_from.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift);
-            let to_h = obs_to.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift);
-            let to_n = obs_to.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift);
-            println!("  Link: BB(H={:.2},N={:.1}) C={:.1} {:?} -> BB(H={:.2},N={:.1}) C={:.1} {:?} str={:.2}",
-                from_h.unwrap_or(0.0), from_n.unwrap_or(0.0),
-                from_carbon.map(|d| d.shift).unwrap_or(0.0),
-                from_carbon.map(|d| d.residue_offset),
-                to_h.unwrap_or(0.0), to_n.unwrap_or(0.0),
-                to_carbon.map(|d| d.shift).unwrap_or(0.0),
-                to_carbon.map(|d| d.residue_offset),
-                link.strength);
-        }
-    }
+    // Debug: sequential links discovery (verbose mode only, see main output)
+    // if iteration == 0 && !links.is_empty() {
+    //     println!("Sequential links: {} found from backbone-sequential carbon matching", links.len());
+    // }
 
     links
 }
