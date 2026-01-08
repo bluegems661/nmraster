@@ -37,7 +37,7 @@ use nmraster_lib::inference::{
     Observation, NucleusToleranceParams, run_observation_assignment, ObservationAssignmentResult,
 };
 use nmraster_lib::testdata::{
-    extract_sequence, fetch_entry_shifts, filter_residue_range, one_to_three, renumber_shifts,
+    extract_sequence, fetch_entry_shifts, filter_residue_range, one_to_three, three_to_one, renumber_shifts,
     DepositedShift, KDEDatabase,
 };
 
@@ -244,16 +244,28 @@ struct GroundTruth {
     peak_to_reference: HashMap<Uuid, Vec<(String, f64)>>,
     /// Expected shifts for each (residue, atom) position from KDE: (residue, atom_name) -> shift_ppm
     expected_atom_shifts: HashMap<(i32, String), f64>,
+    /// Sequence string for looking up residue type
+    sequence: String,
 }
 
 impl GroundTruth {
-    fn new() -> Self {
+    fn new(sequence: &str) -> Self {
         Self {
             peak_to_residue: HashMap::new(),
             peak_to_atom: HashMap::new(),
             peak_to_shifts: HashMap::new(),
             peak_to_reference: HashMap::new(),
             expected_atom_shifts: HashMap::new(),
+            sequence: sequence.to_string(),
+        }
+    }
+
+    /// Get amino acid single-letter code for a residue number (1-indexed)
+    fn get_aa(&self, residue: i32) -> Option<char> {
+        if residue > 0 && (residue as usize) <= self.sequence.len() {
+            self.sequence.chars().nth(residue as usize - 1)
+        } else {
+            None
         }
     }
 
@@ -265,7 +277,9 @@ impl GroundTruth {
     fn register(&mut self, peak: &UnlabeledPeak, residue: i32, atom: &str) {
         self.peak_to_residue.insert(peak.id, residue);
         // Normalize stereo-equivalent atoms for fair evaluation
-        self.peak_to_atom.insert(peak.id, normalize_stereo_atoms(atom));
+        // Pass residue type so we can handle Ile CG1/CG2 correctly
+        let aa = self.get_aa(residue);
+        self.peak_to_atom.insert(peak.id, normalize_stereo_atoms(atom, aa));
         // Store chemical shifts
         let shifts = peak.get_shifts_labeled();
         self.peak_to_shifts.insert(peak.id, shifts);
@@ -284,39 +298,76 @@ impl GroundTruth {
 /// - LEU: CD1/CD2, HD1*/HD2* (two equivalent methyl groups)
 /// - PHE/TYR: CD1/CD2, CE1/CE2 (ring symmetry)
 /// So treating CG1 as CG2 (same residue) should count as correct.
-fn normalize_stereo_atoms(atom_desc: &str) -> String {
+///
+/// IMPORTANT: Isoleucine (I) is special - CG1 and CG2 are NOT stereo-equivalent:
+/// - CG1 (~27 ppm): methylene carbon with HG12, HG13
+/// - CG2 (~17 ppm): methyl carbon with HG21, HG22, HG23
+/// These have a 10 ppm difference and must be distinguished!
+fn normalize_stereo_atoms(atom_desc: &str, aa: Option<char>) -> String {
     let mut result = atom_desc.to_string();
+    let is_ile = aa.map_or(false, |c| c == 'I');
 
     // Normalize carbon names: CG1->CG, CG2->CG, CD1->CD, CD2->CD, etc.
     // But keep CA, CB as-is since they're not stereo-equivalent
-    let stereo_carbons = [
-        ("CG1", "CG"), ("CG2", "CG"),
-        ("CD1", "CD"), ("CD2", "CD"),
-        ("CE1", "CE"), ("CE2", "CE"), ("CE3", "CE"),
-        ("CZ2", "CZ"), ("CZ3", "CZ"),
-    ];
+    // For ILE: Do NOT normalize CG1/CG2 (they're chemically distinct)
+    let stereo_carbons: &[(&str, &str)] = if is_ile {
+        // ILE: CG1/CG2 are NOT equivalent, CD1 is unique (no CD2)
+        // Only normalize aromatic carbons (CE1/CE2/CZ2/CZ3) which don't apply to ILE
+        &[
+            ("CE1", "CE"), ("CE2", "CE"), ("CE3", "CE"),
+            ("CZ2", "CZ"), ("CZ3", "CZ"),
+        ]
+    } else {
+        // VAL/LEU/other: CG1/CG2 ARE equivalent methyls
+        &[
+            ("CG1", "CG"), ("CG2", "CG"),
+            ("CD1", "CD"), ("CD2", "CD"),
+            ("CE1", "CE"), ("CE2", "CE"), ("CE3", "CE"),
+            ("CZ2", "CZ"), ("CZ3", "CZ"),
+        ]
+    };
 
     for (from, to) in stereo_carbons {
         result = result.replace(from, to);
     }
 
     // Normalize proton names attached to stereo-equivalent carbons
-    // HG11,HG12,HG13 -> HG1; HG21,HG22,HG23 -> HG2; then HG1,HG2 -> HG
-    let stereo_protons = [
-        // Methyl protons (3 equivalent H per methyl)
-        ("HG11", "HG"), ("HG12", "HG"), ("HG13", "HG"),
-        ("HG21", "HG"), ("HG22", "HG"), ("HG23", "HG"),
-        ("HD11", "HD"), ("HD12", "HD"), ("HD13", "HD"),
-        ("HD21", "HD"), ("HD22", "HD"), ("HD23", "HD"),
-        // Methylene protons (2 equivalent H)
-        ("HB2", "HB"), ("HB3", "HB"),
-        ("HG2", "HG"), ("HG3", "HG"),
-        ("HD2", "HD"), ("HD3", "HD"),
-        ("HE2", "HE"), ("HE3", "HE"),
-        ("HZ2", "HZ"), ("HZ3", "HZ"),
-        // Alpha protons for Gly
-        ("HA2", "HA"), ("HA3", "HA"),
-    ];
+    // For ILE: Keep HG1x and HG2x separate since they're on different carbons
+    let stereo_protons: &[(&str, &str)] = if is_ile {
+        // ILE: Protons within same methyl/methylene group are equivalent,
+        // but HG1x (on CG1) vs HG2x (on CG2) are NOT
+        &[
+            // Within CG1 methylene: HG12, HG13 are equivalent
+            ("HG12", "HG1"), ("HG13", "HG1"),
+            // Within CG2 methyl: HG21, HG22, HG23 are equivalent
+            ("HG21", "HG2"), ("HG22", "HG2"), ("HG23", "HG2"),
+            // Within CD1 methyl: HD11, HD12, HD13 are equivalent
+            ("HD11", "HD1"), ("HD12", "HD1"), ("HD13", "HD1"),
+            // Methylene protons
+            ("HB2", "HB"), ("HB3", "HB"),
+            ("HD2", "HD"), ("HD3", "HD"),
+            ("HE2", "HE"), ("HE3", "HE"),
+            ("HZ2", "HZ"), ("HZ3", "HZ"),
+            ("HA2", "HA"), ("HA3", "HA"),
+        ]
+    } else {
+        // VAL/LEU/other: HG1x and HG2x are equivalent (both methyl groups equivalent)
+        &[
+            // Methyl protons (3 equivalent H per methyl, both methyls equivalent)
+            ("HG11", "HG"), ("HG12", "HG"), ("HG13", "HG"),
+            ("HG21", "HG"), ("HG22", "HG"), ("HG23", "HG"),
+            ("HD11", "HD"), ("HD12", "HD"), ("HD13", "HD"),
+            ("HD21", "HD"), ("HD22", "HD"), ("HD23", "HD"),
+            // Methylene protons (2 equivalent H)
+            ("HB2", "HB"), ("HB3", "HB"),
+            ("HG2", "HG"), ("HG3", "HG"),
+            ("HD2", "HD"), ("HD3", "HD"),
+            ("HE2", "HE"), ("HE3", "HE"),
+            ("HZ2", "HZ"), ("HZ3", "HZ"),
+            // Alpha protons for Gly
+            ("HA2", "HA"), ("HA3", "HA"),
+        ]
+    };
 
     for (from, to) in stereo_protons {
         result = result.replace(from, to);
@@ -780,8 +831,6 @@ fn generate_peaks_from_bmrb(
     let mut hncacb = Vec::new();
     let mut cbcaconh = Vec::new();
     let mut hbhaconh = Vec::new();
-    let mut ground_truth = GroundTruth::new();
-
     // Group shifts by residue
     let mut by_residue: HashMap<i32, Vec<&DepositedShift>> = HashMap::new();
     for shift in shifts {
@@ -790,6 +839,18 @@ fn generate_peaks_from_bmrb(
             .or_default()
             .push(shift);
     }
+
+    // Build sequence string from deposited shifts
+    let mut residue_codes: Vec<(i32, char)> = by_residue
+        .iter()
+        .filter_map(|(&seq_code, residues)| {
+            residues.first().map(|r| (seq_code, three_to_one(&r.residue_name)))
+        })
+        .collect();
+    residue_codes.sort_by_key(|(seq, _)| *seq);
+    let sequence: String = residue_codes.iter().map(|(_, c)| *c).collect();
+
+    let mut ground_truth = GroundTruth::new(&sequence);
 
     // Carbon-proton pairs: carbon name -> possible proton names
     let carbon_proton_pairs: &[(&str, &[&str])] = &[
@@ -1223,7 +1284,7 @@ fn generate_synthetic_peaks(
     let mut hncacb = Vec::new();
     let mut cbcaconh = Vec::new();
     let mut hbhaconh = Vec::new();
-    let mut ground_truth = GroundTruth::new();
+    let mut ground_truth = GroundTruth::new(sequence);
 
     // Carbon-proton pairs for 13C-HSQC (same as BMRB mode)
     let carbon_proton_pairs: &[(&str, &[&str])] = &[
@@ -2213,7 +2274,9 @@ fn print_chemical_shift_table(
 
         let assigned = assigned_shifts.get(&(*residue, atom_name.clone())).copied()
             .or_else(|| {
-                let normalized = normalize_stereo_atoms(atom_name);
+                // Pass AA for Ile-aware normalization
+                let aa_opt = if aa != '?' { Some(aa) } else { None };
+                let normalized = normalize_stereo_atoms(atom_name, aa_opt);
                 assigned_shifts.get(&(*residue, normalized)).copied()
             });
 

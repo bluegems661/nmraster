@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::data::{PeakExperimentType, UnlabeledPeak, TransferPathway, ResidueOffset, AtomConstraint};
 use crate::data::spectrum::NucleusType;
+use crate::data::residue_topology::{get_topology_by_three, ResidueTopology};
 use crate::inference::scoring::{KDEScorer, ShiftScorer};
 use crate::testdata::{BMRBDatabase, KDEDatabase};
 
@@ -133,12 +134,12 @@ pub struct NucleusToleranceParams {
 impl Default for NucleusToleranceParams {
     fn default() -> Self {
         Self {
-            h_tolerance_base: 0.03,   // 0.03 ppm for protons (~15 Hz at 500 MHz)
-            c_tolerance_base: 0.4,    // 0.4 ppm for carbons
-            n_tolerance_base: 0.4,    // 0.4 ppm for nitrogen
+            h_tolerance_base: 0.02,   // 0.02 ppm for protons (tight for disambiguation)
+            c_tolerance_base: 0.2,    // 0.2 ppm for carbons (sharp 13C lines)
+            n_tolerance_base: 0.05,   // 0.05 ppm for nitrogen (N15 is very sharp)
             tolerance_schedule: ToleranceSchedule::Linear {
-                start_mult: 2.0,  // Start at 2x base
-                end_mult: 1.0,    // End at 1x base
+                start_mult: 4.0,  // Start at 4x base (loose for initial matching)
+                end_mult: 1.0,    // End at 1x base (tight for disambiguation)
             },
         }
     }
@@ -2981,6 +2982,34 @@ pub fn run_observation_assignment(
         .collect();
 
     // Run belief propagation
+    // Identify backbone observations for uniqueness constraint
+    let backbone_indices: Vec<usize> = observations.iter().enumerate()
+        .filter(|(_, obs)| obs.experiment_type == PeakExperimentType::Hsqc15N)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    // DEBUG: Find CG2-range carbon observations and track them
+    let debug_cg2_indices: Vec<usize> = observations.iter().enumerate()
+        .filter(|(_, obs)| {
+            obs.dimensions.iter().any(|d| {
+                d.nucleus == NucleusType::C13 && d.shift > 15.0 && d.shift < 25.0
+            })
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if params.verbose && !debug_cg2_indices.is_empty() {
+        println!("\n=== CG-RANGE CARBON OBSERVATIONS ===");
+        for &idx in &debug_cg2_indices {
+            let obs = &observations[idx];
+            let shifts: Vec<String> = obs.dimensions.iter()
+                .map(|d| format!("{:?}={:.2}", d.nucleus, d.shift))
+                .collect();
+            println!("  obs[{}]: {} type={:?}", idx, shifts.join(", "), obs.experiment_type);
+        }
+        println!("=====================================\n");
+    }
+
     let max_iterations = params.max_iterations;
     for iteration in 0..max_iterations {
         let progress = iteration as f64 / max_iterations as f64;
@@ -3002,10 +3031,15 @@ pub fn run_observation_assignment(
         );
 
         // Message passing update with both same-residue and sequential factors
-        let new_beliefs = update_observation_beliefs_with_sequential(
+        let mut new_beliefs = update_observation_beliefs_with_sequential(
             &beliefs, &typing_scores, &correlation_scores, &sequential_links,
             domain_size, interp.tocsy_weight, interp.typing_weight, interp.sequential_weight
         );
+
+        // HARD CONSTRAINT: Backbone uniqueness - each residue gets at most one backbone NH
+        // Implements exclusion factor: if peak A has high belief for residue R,
+        // other backbone peaks should have lower belief for R
+        apply_backbone_uniqueness_factor(&mut new_beliefs, &backbone_indices, domain_size);
 
         // Apply damping to prevent oscillation on loopy graph
         let damping = params.damping;
@@ -3035,19 +3069,109 @@ pub fn run_observation_assignment(
         }
     }
 
-    // Extract assignments
-    observations.iter().zip(beliefs.iter()).map(|(obs, belief)| {
-        let (best_idx, &best_prob) = belief.iter().enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .unwrap_or((0, &0.0));
+    // Extract assignments with backbone uniqueness constraint
+    // Backbone peaks (HSQC15N) must be assigned to unique residues
+    let mut assigned_backbone_residues: HashSet<i32> = HashSet::new();
+    let mut results: Vec<ObservationAssignmentResult> = Vec::with_capacity(observations.len());
 
-        ObservationAssignmentResult {
+    // Sort backbone peaks by confidence (highest first) for greedy assignment
+    let mut backbone_indices: Vec<(usize, f64)> = observations.iter().enumerate()
+        .filter(|(_, obs)| obs.experiment_type == PeakExperimentType::Hsqc15N)
+        .map(|(idx, _)| {
+            let best_prob = beliefs[idx].iter().skip(1).fold(0.0f64, |a, &b| a.max(b));
+            (idx, best_prob)
+        })
+        .collect();
+    backbone_indices.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // First pass: Assign backbone peaks greedily with uniqueness
+    let mut assigned: HashSet<usize> = HashSet::new();
+    for (obs_idx, _) in &backbone_indices {
+        let belief = &beliefs[*obs_idx];
+        let obs = &observations[*obs_idx];
+
+        // Find best available residue (not already assigned to another backbone)
+        let best = belief.iter().enumerate()
+            .skip(1)  // Skip unassigned (index 0)
+            .filter(|(r, _)| !assigned_backbone_residues.contains(&(*r as i32)))
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
+
+        let (best_idx, best_prob) = match best {
+            Some((idx, &prob)) => (idx, prob),
+            None => (0, belief[0]),  // Fall back to unassigned if all residues taken
+        };
+
+        assigned_backbone_residues.insert(best_idx as i32);
+        assigned.insert(*obs_idx);
+
+        results.push(ObservationAssignmentResult {
             observation_id: obs.id,
             assigned_residue: best_idx as i32,
             confidence: best_prob,
             experiment_type: obs.experiment_type,
+        });
+    }
+
+    // Second pass: Assign all other observations (no uniqueness constraint)
+    for (obs_idx, obs) in observations.iter().enumerate() {
+        if assigned.contains(&obs_idx) {
+            continue;  // Already assigned in backbone pass
         }
-    }).collect()
+
+        let belief = &beliefs[obs_idx];
+        let (best_idx, &best_prob) = belief.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap_or((0, &0.0));
+
+        results.push(ObservationAssignmentResult {
+            observation_id: obs.id,
+            assigned_residue: best_idx as i32,
+            confidence: best_prob,
+            experiment_type: obs.experiment_type,
+        });
+    }
+
+    // Re-sort results by original observation order for consistency
+    results.sort_by_key(|r| observations.iter().position(|o| o.id == r.observation_id).unwrap_or(0));
+
+    // Debug: Print backbone peak assignments
+    if params.verbose {
+        println!("\n=== BACKBONE PEAK ASSIGNMENTS ===");
+        for (obs, result) in observations.iter().zip(results.iter()) {
+            if obs.experiment_type == PeakExperimentType::Hsqc15N {
+                let shifts: Vec<_> = obs.dimensions.iter()
+                    .map(|d| format!("{:?}={:.3}", d.nucleus, d.shift))
+                    .collect();
+                println!("  HSQC15N: {} -> residue {} (conf={:.3})",
+                    shifts.join(", "), result.assigned_residue, result.confidence);
+            }
+        }
+        println!("================================\n");
+
+        // Debug: Print CG-range carbon assignments
+        println!("=== CG-RANGE CARBON ASSIGNMENTS ===");
+        for (obs_idx, (obs, result)) in observations.iter().zip(results.iter()).enumerate() {
+            let c_shift = obs.dimensions.iter()
+                .find(|d| d.nucleus == NucleusType::C13)
+                .map(|d| d.shift);
+            if let Some(c) = c_shift {
+                if c > 15.0 && c < 25.0 {
+                    let h_shift = obs.dimensions.iter()
+                        .find(|d| d.nucleus == NucleusType::H1)
+                        .map(|d| d.shift)
+                        .unwrap_or(0.0);
+                    let seq_char = if result.assigned_residue > 0 && (result.assigned_residue as usize) <= sequence.len() {
+                        sequence.chars().nth(result.assigned_residue as usize - 1).unwrap_or('?')
+                    } else { '?' };
+                    println!("  obs[{}] C={:.2} H={:.2} -> res {} ({}) conf={:.3}",
+                        obs_idx, c, h_shift, result.assigned_residue, seq_char, result.confidence);
+                }
+            }
+        }
+        println!("===================================\n");
+    }
+
+    results
 }
 
 /// Compute typing scores for observations based on chemical shifts.
@@ -3091,7 +3215,11 @@ fn compute_observation_typing_scores(
 
 /// Score how well an observation matches a residue type.
 ///
-/// Physics-based: uses atom_constraint instead of nucleus-based guessing.
+/// Physics-based: uses atom_constraint AND residue topology for hard constraints.
+///
+/// HARD CONSTRAINT: If an atom doesn't exist in the residue type's topology,
+/// score = 0. This is physical law, not a preference.
+///
 /// NOTE: For now, we use ALL dimensions for typing, including inter-residue carbons.
 /// A more sophisticated model would need to handle that inter-residue observations
 /// provide evidence about BOTH the anchor residue AND the preceding residue.
@@ -3103,16 +3231,41 @@ fn score_observation_for_residue_type(
     _iteration: usize,
     _max_iterations: usize,
 ) -> f64 {
+    // Get topology for this residue type - enables hard constraints
+    let topology = get_topology_by_three(res_type);
+
     let mut log_score = 0.0;
     let debug_this = false;  // Disable verbose debug
 
     for dim in &obs.dimensions {
         // Physics-based: use atom_constraint instead of nucleus-based guessing
         let atom_candidates = atoms_from_constraint(&dim.atom_constraint, dim.nucleus);
+
+        // HARD CONSTRAINT: Filter to atoms that actually exist in this residue type
+        let valid_atoms: Vec<&str> = if let Some(topo) = topology {
+            atom_candidates.iter()
+                .filter(|&atom| topo.has_atom(atom))
+                .copied()
+                .collect()
+        } else {
+            // No topology found - fall back to all candidates
+            atom_candidates.clone()
+        };
+
+        // HARD CONSTRAINT: If no valid atoms exist, this assignment is impossible
+        if valid_atoms.is_empty() && topology.is_some() {
+            if debug_this {
+                println!("  HARD CONSTRAINT: {} has no atoms {:?} (candidates were {:?})",
+                         res_type, valid_atoms, atom_candidates);
+            }
+            return 0.0;  // Impossible assignment - residue doesn't have these atoms
+        }
+
+        // Score using KDE among valid atoms only
         let mut best_density = 1e-10;
         let mut best_atom = "";
 
-        for atom in &atom_candidates {
+        for atom in &valid_atoms {
             let density = kde.density(res_type, atom, dim.shift);
             if density > best_density {
                 best_density = density;
@@ -3121,8 +3274,8 @@ fn score_observation_for_residue_type(
         }
 
         if debug_this {
-            println!("  SCORE: {} {:?} constraint={:?} shift={:.2} -> atoms={:?}, best={}:{:.2e}",
-                     res_type, dim.nucleus, dim.atom_constraint, dim.shift, atom_candidates, best_atom, best_density);
+            println!("  SCORE: {} {:?} constraint={:?} shift={:.2} -> valid_atoms={:?}, best={}:{:.2e}",
+                     res_type, dim.nucleus, dim.atom_constraint, dim.shift, valid_atoms, best_atom, best_density);
         }
 
         log_score += best_density.max(1e-10).ln();
@@ -3371,19 +3524,48 @@ fn compute_observation_pair_correlation(
     }
 
     // CASE 2: Both ThroughBond (TOCSY-type experiments)
-    // Require BOTH protons to match (strict spin system link)
+    // First check: if they share the same (C13, H1_direct) pair, they're the same carbon
+    // This is a HARD constraint for 3D HSQC-TOCSY observations
     if obs_a.transfer_pathway == TransferPathway::ThroughBond
        && obs_b.transfer_pathway == TransferPathway::ThroughBond
     {
-        let ha_dims = get_proton_shifts(obs_a);
-        let hb_dims = get_proton_shifts(obs_b);
+        // Get carbon shifts (if present)
+        let ca_c = obs_a.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::C13)
+            .map(|d| d.shift);
+        let cb_c = obs_b.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::C13)
+            .map(|d| d.shift);
 
-        if ha_dims.len() >= 2 && hb_dims.len() >= 2 {
+        // For 3D HSQC-TOCSY-13C: dimensions are (C13, H1_direct, H1_tocsy)
+        // The FIRST H1 dimension is the direct-attached proton
+        let ha_protons = get_proton_shifts(obs_a);
+        let hb_protons = get_proton_shifts(obs_b);
+
+        // SAME-CARBON CONSTRAINT: If both have C13 AND first H1 matches, they're the same carbon!
+        if let (Some(c_a), Some(c_b)) = (ca_c, cb_c) {
+            if !ha_protons.is_empty() && !hb_protons.is_empty() {
+                let h_a_direct = ha_protons[0];  // First proton is direct-attached
+                let h_b_direct = hb_protons[0];
+
+                // Check if same (C, H_direct) pair - HARD constraint, very high score
+                if let (Some(c_score), Some(h_score)) = (
+                    shifts_match(c_a, c_b, c_tol),
+                    shifts_match(h_a_direct, h_b_direct, h_tol)
+                ) {
+                    // Same carbon atom! Return strong correlation (near 1.0)
+                    return (c_score + h_score) / 2.0;
+                }
+            }
+        }
+
+        // Fall back to standard TOCSY correlation: require BOTH protons to match
+        if ha_protons.len() >= 2 && hb_protons.len() >= 2 {
             // Check both orientations
-            let match_direct = shifts_match(ha_dims[0], hb_dims[0], h_tol)
-                .and_then(|s1| shifts_match(ha_dims[1], hb_dims[1], h_tol).map(|s2| (s1 + s2) / 2.0));
-            let match_flipped = shifts_match(ha_dims[0], hb_dims[1], h_tol)
-                .and_then(|s1| shifts_match(ha_dims[1], hb_dims[0], h_tol).map(|s2| (s1 + s2) / 2.0));
+            let match_direct = shifts_match(ha_protons[0], hb_protons[0], h_tol)
+                .and_then(|s1| shifts_match(ha_protons[1], hb_protons[1], h_tol).map(|s2| (s1 + s2) / 2.0));
+            let match_flipped = shifts_match(ha_protons[0], hb_protons[1], h_tol)
+                .and_then(|s1| shifts_match(ha_protons[1], hb_protons[0], h_tol).map(|s2| (s1 + s2) / 2.0));
 
             if let Some(score) = match_direct.or(match_flipped) {
                 return score;
@@ -3734,6 +3916,60 @@ fn update_observation_beliefs_with_sequential(
     }
 
     new_beliefs
+}
+
+/// Apply backbone uniqueness constraint: each residue gets at most one backbone NH.
+///
+/// This is a HARD CONSTRAINT that implements exclusion between backbone peaks.
+/// For each residue position, the backbone peak with highest belief "wins" and
+/// other backbone peaks have their belief for that residue set to near-zero.
+///
+/// This prevents multiple backbone peaks from being assigned to the same residue.
+fn apply_backbone_uniqueness_factor(
+    beliefs: &mut [Vec<f64>],
+    backbone_indices: &[usize],
+    domain_size: usize,
+) {
+    if backbone_indices.len() <= 1 {
+        return;  // No competition with 0 or 1 backbone peak
+    }
+
+    // For each residue position (skip index 0 = unassigned)
+    for residue in 1..domain_size {
+        // Find which backbone peak has highest belief for this residue
+        let mut best_backbone_idx: Option<usize> = None;
+        let mut best_belief = 0.0;
+
+        for &bb_idx in backbone_indices {
+            let belief = beliefs[bb_idx][residue];
+            if belief > best_belief {
+                best_belief = belief;
+                best_backbone_idx = Some(bb_idx);
+            }
+        }
+
+        // Penalize all OTHER backbone peaks for this residue
+        // Use strong penalty - this is a physical constraint
+        if let Some(winner_idx) = best_backbone_idx {
+            for &bb_idx in backbone_indices {
+                if bb_idx != winner_idx {
+                    // Suppress belief for this residue in losing backbone peaks
+                    // Multiply by small factor to strongly discourage same-residue assignment
+                    beliefs[bb_idx][residue] *= 0.01;
+                }
+            }
+        }
+    }
+
+    // Re-normalize beliefs for backbone peaks after applying exclusion
+    for &bb_idx in backbone_indices {
+        let sum: f64 = beliefs[bb_idx].iter().sum();
+        if sum > 0.0 {
+            for v in &mut beliefs[bb_idx] {
+                *v /= sum;
+            }
+        }
+    }
 }
 
 // =============================================================================

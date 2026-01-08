@@ -8,9 +8,11 @@ pub mod molecule;
 pub mod experiment;
 pub mod constraint;
 pub mod spin_system;
+pub mod residue_topology;
 
 pub use spectrum::*;
 pub use molecule::*;
 pub use experiment::*;
 pub use constraint::*;
 pub use spin_system::*;
+pub use residue_topology::*;
