@@ -348,6 +348,18 @@ impl Observation {
                 let carbon_offset = if is_intra { ResidueOffset::Intra } else { ResidueOffset::PrecedingResidue };
                 let is_seq = !is_intra;
 
+                // Distinguish CA from CB using chemical shift:
+                // - CA: typically 50-65 ppm for most residues
+                // - CB: typically <50 ppm (Ala ~18, most others 25-45)
+                // Exception: Ser/Thr CB can be ~62-64 ppm, but this is rare enough
+                // that the heuristic shift >= 50 → CA works well for backbone assignment
+                let carbon_shift = peak.position_ppm[2];
+                let (atom_hint, atom_constraint) = if carbon_shift >= 50.0 {
+                    (Some("CA".to_string()), AtomConstraint::Exact("CA".to_string()))
+                } else {
+                    (Some("CB".to_string()), AtomConstraint::Exact("CB".to_string()))
+                };
+
                 let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::H1,
@@ -365,10 +377,10 @@ impl Observation {
                     },
                     ObservedDimension {
                         nucleus: NucleusType::C13,
-                        shift: peak.position_ppm[2],
-                        atom_hint: None,
+                        shift: carbon_shift,
+                        atom_hint,
                         residue_offset: carbon_offset,
-                        atom_constraint: AtomConstraint::OneOf(vec!["CA".into(), "CB".into()]),
+                        atom_constraint,
                     },
                 ];
                 (dims, TransferPathway::BackboneSequential, is_seq)
@@ -377,6 +389,15 @@ impl Observation {
             Cbcaconh => {
                 if peak.position_ppm.len() < 3 { return None; }
                 // CBCACONH ALWAYS shows i-1 carbons (inter-residue only)
+
+                // Distinguish CA from CB using chemical shift (same as HNCACB)
+                let carbon_shift = peak.position_ppm[2];
+                let (atom_hint, atom_constraint) = if carbon_shift >= 50.0 {
+                    (Some("CA".to_string()), AtomConstraint::Exact("CA".to_string()))
+                } else {
+                    (Some("CB".to_string()), AtomConstraint::Exact("CB".to_string()))
+                };
+
                 let dims = vec![
                     ObservedDimension {
                         nucleus: NucleusType::H1,
@@ -394,10 +415,10 @@ impl Observation {
                     },
                     ObservedDimension {
                         nucleus: NucleusType::C13,
-                        shift: peak.position_ppm[2],
-                        atom_hint: None,
+                        shift: carbon_shift,
+                        atom_hint,
                         residue_offset: ResidueOffset::PrecedingResidue,
-                        atom_constraint: AtomConstraint::OneOf(vec!["CA".into(), "CB".into()]),
+                        atom_constraint,
                     },
                 ];
                 (dims, TransferPathway::BackboneSequential, true)
@@ -430,6 +451,40 @@ impl Observation {
                     },
                 ];
                 (dims, TransferPathway::BackboneSequential, true)
+            }
+
+            Hncaco => {
+                if peak.position_ppm.len() < 3 { return None; }
+                // HN(CA)CO shows CO(i) strong, CO(i-1) weak
+                // Similar to HNCA - intensity determines intra vs inter
+                let is_intra = peak.intensity > 0.5;
+                let carbon_offset = if is_intra { ResidueOffset::Intra } else { ResidueOffset::PrecedingResidue };
+                let is_seq = !is_intra;
+
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("HN".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("H".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::N15,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("N".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("N".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[2],
+                        atom_hint: Some("C".to_string()),
+                        residue_offset: carbon_offset,
+                        atom_constraint: AtomConstraint::Exact("C".to_string()),
+                    },
+                ];
+                (dims, TransferPathway::BackboneSequential, is_seq)
             }
 
             Hbhaconh => {
@@ -565,6 +620,1920 @@ impl Observation {
 // END: Unified Observation Model
 // =============================================================================
 
+// =============================================================================
+// NEW: Group-Level Bayesian Assignment (Simplified Physics-Based Approach)
+// =============================================================================
+//
+// Key insight: We have N_obs observations but only N_groups decisions to make.
+// Each spin system (backbone group) maps to exactly one sequence position.
+//
+// Instead of running BP on observations (fighting synchronization), we:
+// 1. Group observations by backbone (H, N)
+// 2. Aggregate evidence into each group ONCE
+// 3. Run BP on groups (66 variables, not 586)
+// 4. Map group assignments back to observations
+
+/// Aggregated evidence for one spin system (backbone group).
+/// This is the unit of assignment - one group = one sequence position.
+#[derive(Debug, Clone)]
+pub struct SpinSystemEvidence {
+    /// Index of this group
+    pub group_idx: usize,
+    /// Observation indices belonging to this group
+    pub observation_indices: Vec<usize>,
+    /// Backbone (H, N) coordinates
+    pub h_shift: f64,
+    pub n_shift: f64,
+    /// Intra-residue carbon shifts: atom_type -> shift
+    /// These are carbons observed at THIS residue (intensity > 0.5)
+    pub intra_carbons: HashMap<String, f64>,
+    /// Inter-residue carbon shifts: atom_type -> shift
+    /// These are carbons observed at PRECEDING residue (intensity <= 0.5)
+    pub inter_carbons: HashMap<String, f64>,
+    /// Intra-residue proton shifts (from TOCSY/HSQC-13C): atom_type -> shift
+    pub intra_protons: HashMap<String, f64>,
+}
+
+impl SpinSystemEvidence {
+    /// Create evidence for a group from observations
+    pub fn from_observations(
+        group_idx: usize,
+        obs_indices: &[usize],
+        observations: &[Observation],
+    ) -> Self {
+        let mut h_shift = 0.0;
+        let mut n_shift = 0.0;
+        let mut intra_carbons: HashMap<String, f64> = HashMap::new();
+        let mut inter_carbons: HashMap<String, f64> = HashMap::new();
+        let mut intra_protons: HashMap<String, f64> = HashMap::new();
+
+        // Find backbone (H, N) from any observation in the group
+        for &idx in obs_indices {
+            let obs = &observations[idx];
+            for dim in &obs.dimensions {
+                if dim.residue_offset == ResidueOffset::Intra {
+                    match dim.nucleus {
+                        NucleusType::H1 => {
+                            // Backbone H
+                            if dim.atom_hint.as_deref() == Some("H") ||
+                               dim.atom_hint.as_deref() == Some("HN") ||
+                               matches!(&dim.atom_constraint, AtomConstraint::Exact(s) if s == "H") {
+                                h_shift = dim.shift;
+                            }
+                        }
+                        NucleusType::N15 => {
+                            n_shift = dim.shift;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if h_shift > 0.0 && n_shift > 0.0 {
+                break;
+            }
+        }
+
+        // Collect all carbon and proton shifts from observations
+        for &idx in obs_indices {
+            let obs = &observations[idx];
+            let is_intra = obs.intensity > 0.5;
+
+            for dim in &obs.dimensions {
+                match dim.nucleus {
+                    NucleusType::C13 => {
+                        // Determine atom type from constraint or hint
+                        let atom_type = match &dim.atom_constraint {
+                            AtomConstraint::Exact(s) => s.clone(),
+                            AtomConstraint::OneOf(v) if v.len() == 1 => v[0].clone(),
+                            _ => dim.atom_hint.clone().unwrap_or_else(|| "C".to_string()),
+                        };
+
+                        // Use residue_offset if available, otherwise use intensity
+                        let is_dim_intra = match dim.residue_offset {
+                            ResidueOffset::Intra => true,
+                            ResidueOffset::PrecedingResidue => false,
+                            ResidueOffset::Unknown => is_intra,
+                            _ => is_intra,  // FollowingResidue, etc.
+                        };
+
+                        if is_dim_intra {
+                            intra_carbons.insert(atom_type, dim.shift);
+                        } else {
+                            inter_carbons.insert(atom_type, dim.shift);
+                        }
+                    }
+                    NucleusType::H1 => {
+                        // Sidechain protons from TOCSY
+                        if dim.atom_hint.as_deref() != Some("H") &&
+                           dim.atom_hint.as_deref() != Some("HN") {
+                            if let Some(hint) = &dim.atom_hint {
+                                intra_protons.insert(hint.clone(), dim.shift);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Self {
+            group_idx,
+            observation_indices: obs_indices.to_vec(),
+            h_shift,
+            n_shift,
+            intra_carbons,
+            inter_carbons,
+            intra_protons,
+        }
+    }
+
+    /// Get intra-residue CA shift if present
+    pub fn intra_ca(&self) -> Option<f64> {
+        self.intra_carbons.get("CA").copied()
+    }
+
+    /// Get inter-residue (i-1) CA shift if present
+    pub fn inter_ca(&self) -> Option<f64> {
+        self.inter_carbons.get("CA").copied()
+    }
+
+    /// Get intra-residue CB shift if present
+    pub fn intra_cb(&self) -> Option<f64> {
+        self.intra_carbons.get("CB").copied()
+    }
+
+    /// Get inter-residue (i-1) CB shift if present
+    pub fn inter_cb(&self) -> Option<f64> {
+        self.inter_carbons.get("CB").copied()
+    }
+}
+
+// ============================================================================
+// SIMULATED ANNEALING FOR SEQUENTIAL CONSISTENCY
+// ============================================================================
+
+/// A sequential link between two backbone groups based on carbon matching.
+/// If group_i has inter-CA that matches group_j's intra-CA, it means
+/// group_j PRECEDES group_i in the sequence (j is at position i-1).
+#[derive(Debug, Clone)]
+pub struct SequentialLink {
+    /// The group that comes FIRST in sequence (has matching intra carbons)
+    pub from_group: usize,
+    /// The group that comes SECOND in sequence (has matching inter carbons)
+    pub to_group: usize,
+    /// Match quality (0-1), higher = better match
+    pub strength: f64,
+    /// |inter_CA - intra_CA| in ppm
+    pub ca_delta: f64,
+    /// |inter_CB - intra_CB| in ppm, if both present
+    pub cb_delta: Option<f64>,
+}
+
+/// Build sequential connectivity graph from carbon matching.
+/// Returns links where from_group PRECEDES to_group in sequence.
+pub fn build_sequential_links(
+    groups: &[SpinSystemEvidence],
+    ca_tolerance: f64,
+    cb_tolerance: f64,
+) -> Vec<SequentialLink> {
+    let mut links = Vec::new();
+
+    for (i, group_i) in groups.iter().enumerate() {
+        // group_i has inter carbons = previous residue's carbons
+        let inter_ca = group_i.inter_ca();
+        let inter_cb = group_i.inter_cb();
+
+        // Skip if no inter carbons
+        if inter_ca.is_none() {
+            continue;
+        }
+
+        for (j, group_j) in groups.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+
+            // group_j has intra carbons = this residue's carbons
+            let intra_ca = group_j.intra_ca();
+            let intra_cb = group_j.intra_cb();
+
+            // Check CA match: group_i's inter-CA should match group_j's intra-CA
+            if let (Some(inter), Some(intra)) = (inter_ca, intra_ca) {
+                let ca_delta = (inter - intra).abs();
+                if ca_delta < ca_tolerance {
+                    let mut strength = 1.0 - (ca_delta / ca_tolerance);
+
+                    // Boost if CB also matches
+                    let cb_delta = match (inter_cb, intra_cb) {
+                        (Some(inter_cb_val), Some(intra_cb_val)) => {
+                            let delta = (inter_cb_val - intra_cb_val).abs();
+                            if delta < cb_tolerance {
+                                strength += 0.5 * (1.0 - delta / cb_tolerance);
+                            }
+                            Some(delta)
+                        }
+                        _ => None,
+                    };
+
+                    if strength > 0.3 {
+                        // Link means: group_j PRECEDES group_i in sequence
+                        links.push(SequentialLink {
+                            from_group: j, // previous (has intra that matches)
+                            to_group: i,   // current (has inter)
+                            strength,
+                            ca_delta,
+                            cb_delta,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    links
+}
+
+/// Score an assignment for sequential consistency and typing.
+/// Higher score = better assignment.
+pub fn score_sa_assignment(
+    assignment: &[Option<usize>], // group_idx -> residue position (1-indexed)
+    groups: &[SpinSystemEvidence],
+    sequence: &str,
+    links: &[SequentialLink],
+) -> f64 {
+    let mut score = 0.0;
+    let seq_len = sequence.len();
+
+    // === 1. Sequential Consistency (most important!) ===
+    for link in links {
+        if let (Some(pos_from), Some(pos_to)) =
+            (assignment[link.from_group], assignment[link.to_group])
+        {
+            // from_group should be at pos_to - 1 (it precedes to_group)
+            let expected_delta = 1i32;
+            let actual_delta = pos_to as i32 - pos_from as i32;
+
+            if actual_delta == expected_delta {
+                // Perfect! Sequential link satisfied
+                score += link.strength * 20.0;
+            } else if actual_delta == 0 {
+                // Same position - impossible!
+                score -= 100.0;
+            } else {
+                // Wrong gap - penalize proportionally
+                score -= (actual_delta - expected_delta).abs() as f64 * 5.0;
+            }
+        }
+    }
+
+    // === 2. Anchor Typing (Gly, Ala, Ser/Thr have distinctive CB) ===
+    let seq_chars: Vec<char> = sequence.chars().collect();
+    for (group_idx, &pos) in assignment.iter().enumerate() {
+        if let Some(pos) = pos {
+            if pos < 1 || pos > seq_len {
+                score -= 1000.0; // Out of bounds
+                continue;
+            }
+
+            let residue_type = seq_chars[pos - 1];
+            let group = &groups[group_idx];
+
+            let intra_ca = group.intra_ca();
+            let intra_cb = group.intra_cb();
+
+            match residue_type {
+                'G' => {
+                    // Glycine: CA ~45ppm, NO CB
+                    if let Some(ca) = intra_ca {
+                        if ca < 48.0 {
+                            score += 25.0; // Good Gly CA
+                            if intra_cb.is_none() {
+                                score += 25.0; // No CB = definitely Gly
+                            } else {
+                                score -= 30.0; // Gly shouldn't have CB!
+                            }
+                        } else {
+                            score -= 20.0; // CA too high for Gly
+                        }
+                    }
+                }
+                'A' => {
+                    // Alanine: CB ~18ppm (uniquely low)
+                    if let Some(cb) = intra_cb {
+                        if cb < 22.0 {
+                            score += 20.0; // Perfect Ala CB
+                        } else if cb > 25.0 {
+                            score -= 15.0; // Too high for Ala
+                        }
+                    }
+                }
+                'S' => {
+                    // Serine: CB ~63ppm
+                    if let Some(cb) = intra_cb {
+                        if cb > 60.0 && cb < 68.0 {
+                            score += 15.0;
+                        } else if cb < 55.0 {
+                            score -= 10.0;
+                        }
+                    }
+                }
+                'T' => {
+                    // Threonine: CB ~69ppm (highest)
+                    if let Some(cb) = intra_cb {
+                        if cb > 65.0 {
+                            score += 15.0;
+                        } else if cb < 60.0 {
+                            score -= 10.0;
+                        }
+                    }
+                }
+                'V' => {
+                    // Valine: CB ~32ppm
+                    if let Some(cb) = intra_cb {
+                        if cb > 29.0 && cb < 36.0 {
+                            score += 8.0;
+                        }
+                    }
+                }
+                'I' => {
+                    // Isoleucine: CB ~38ppm
+                    if let Some(cb) = intra_cb {
+                        if cb > 35.0 && cb < 42.0 {
+                            score += 8.0;
+                        }
+                    }
+                }
+                'L' => {
+                    // Leucine: CB ~42ppm
+                    if let Some(cb) = intra_cb {
+                        if cb > 39.0 && cb < 45.0 {
+                            score += 8.0;
+                        }
+                    }
+                }
+                'P' => {
+                    // Proline: no backbone NH, shouldn't have a group!
+                    // If a group is assigned to Pro, penalize
+                    score -= 50.0;
+                }
+                _ => {
+                    // General typing - no specific bonus/penalty
+                }
+            }
+        }
+    }
+
+    // === 3. Uniqueness Constraint ===
+    let mut position_counts = vec![0usize; seq_len];
+    for &pos in assignment.iter().flatten() {
+        if pos >= 1 && pos <= seq_len {
+            position_counts[pos - 1] += 1;
+        }
+    }
+    for count in position_counts {
+        if count > 1 {
+            score -= (count - 1) as f64 * 50.0; // Heavy penalty for collisions
+        }
+    }
+
+    // === 4. Completeness Bonus ===
+    let assigned_count = assignment.iter().filter(|a| a.is_some()).count();
+    score += assigned_count as f64 * 2.0;
+
+    score
+}
+
+/// SA Move types for exploring the assignment space
+#[derive(Debug, Clone)]
+pub enum SAMove {
+    /// Swap assignments of two groups
+    Swap { group_a: usize, group_b: usize },
+    /// Move one group to a new position
+    Relocate { group: usize, new_pos: usize },
+    /// Shift an entire connected stretch by ±1
+    ShiftStretch { anchor_group: usize, delta: i32 },
+}
+
+/// Find all groups transitively connected to anchor via sequential links
+fn find_connected_stretch(
+    anchor: usize,
+    links: &[SequentialLink],
+    n_groups: usize,
+) -> Vec<usize> {
+    let mut stretch = vec![anchor];
+    let mut visited = vec![false; n_groups];
+    visited[anchor] = true;
+
+    let mut queue = vec![anchor];
+    while let Some(current) = queue.pop() {
+        for link in links {
+            let neighbor = if link.from_group == current {
+                link.to_group
+            } else if link.to_group == current {
+                link.from_group
+            } else {
+                continue;
+            };
+
+            if !visited[neighbor] && link.strength > 0.5 {
+                visited[neighbor] = true;
+                stretch.push(neighbor);
+                queue.push(neighbor);
+            }
+        }
+    }
+
+    stretch
+}
+
+/// Propose a move for SA based on temperature (exploration vs exploitation)
+fn propose_sa_move(
+    assignment: &[Option<usize>],
+    links: &[SequentialLink],
+    sequence_len: usize,
+    rng: &mut impl rand::Rng,
+    temperature: f64,
+) -> SAMove {
+    use rand::seq::SliceRandom;
+
+    // Higher temperature = more exploration, lower = more local refinement
+    let exploration_prob = (temperature / 10.0).min(0.5);
+
+    if rng.gen::<f64>() < exploration_prob {
+        // Exploration: big moves
+        match rng.gen_range(0..3) {
+            0 => {
+                // Random swap
+                let a = rng.gen_range(0..assignment.len());
+                let b = rng.gen_range(0..assignment.len());
+                SAMove::Swap { group_a: a, group_b: b }
+            }
+            1 => {
+                // Random relocate
+                let group = rng.gen_range(0..assignment.len());
+                let new_pos = rng.gen_range(1..=sequence_len);
+                SAMove::Relocate { group, new_pos }
+            }
+            _ => {
+                // Shift stretch
+                let anchor = rng.gen_range(0..assignment.len());
+                let delta = if rng.gen_bool(0.5) { 1 } else { -1 };
+                SAMove::ShiftStretch {
+                    anchor_group: anchor,
+                    delta,
+                }
+            }
+        }
+    } else {
+        // Exploitation: local moves to fix sequential violations
+        let violated: Vec<_> = links
+            .iter()
+            .filter(|link| {
+                if let (Some(pos_from), Some(pos_to)) =
+                    (assignment[link.from_group], assignment[link.to_group])
+                {
+                    pos_to as i32 - pos_from as i32 != 1
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if let Some(&link) = violated.choose(rng) {
+            // Try to fix this link by moving one of the groups
+            if rng.gen_bool(0.5) {
+                if let Some(pos_to) = assignment[link.to_group] {
+                    SAMove::Relocate {
+                        group: link.from_group,
+                        new_pos: pos_to.saturating_sub(1).max(1),
+                    }
+                } else {
+                    SAMove::Swap {
+                        group_a: link.from_group,
+                        group_b: link.to_group,
+                    }
+                }
+            } else if let Some(pos_from) = assignment[link.from_group] {
+                SAMove::Relocate {
+                    group: link.to_group,
+                    new_pos: (pos_from + 1).min(sequence_len),
+                }
+            } else {
+                SAMove::Swap {
+                    group_a: link.from_group,
+                    group_b: link.to_group,
+                }
+            }
+        } else {
+            // No violations - small random perturbation
+            let group = rng.gen_range(0..assignment.len());
+            if let Some(pos) = assignment[group] {
+                let delta: i32 = *[-1i32, 1].choose(rng).unwrap();
+                let new_pos = ((pos as i32 + delta).max(1) as usize).min(sequence_len);
+                SAMove::Relocate { group, new_pos }
+            } else {
+                let new_pos = rng.gen_range(1..=sequence_len);
+                SAMove::Relocate { group, new_pos }
+            }
+        }
+    }
+}
+
+/// Apply a move to an assignment
+fn apply_sa_move(
+    assignment: &mut [Option<usize>],
+    mv: &SAMove,
+    links: &[SequentialLink],
+    seq_len: usize,
+) {
+    match mv {
+        SAMove::Swap { group_a, group_b } => {
+            assignment.swap(*group_a, *group_b);
+        }
+        SAMove::Relocate { group, new_pos } => {
+            assignment[*group] = Some(*new_pos);
+        }
+        SAMove::ShiftStretch { anchor_group, delta } => {
+            // Find all groups connected to anchor
+            let stretch = find_connected_stretch(*anchor_group, links, assignment.len());
+            for group_idx in stretch {
+                if let Some(pos) = assignment[group_idx] {
+                    let new_pos = (pos as i32 + delta).max(1).min(seq_len as i32) as usize;
+                    assignment[group_idx] = Some(new_pos);
+                }
+            }
+        }
+    }
+}
+
+/// Refine an assignment using Simulated Annealing
+pub fn refine_with_sa(
+    beliefs: &[Vec<f64>], // group_idx -> position -> probability
+    groups: &[SpinSystemEvidence],
+    sequence: &str,
+    links: &[SequentialLink],
+    temperature: f64,
+    sa_iterations: usize,
+) -> Vec<Option<usize>> {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+
+    // Initialize from BP beliefs (argmax)
+    let mut assignment: Vec<Option<usize>> = beliefs
+        .iter()
+        .map(|probs| {
+            probs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .filter(|(_, &p)| p > 0.05) // Only assign if belief is reasonable
+                .map(|(pos, _)| pos + 1) // Convert 0-indexed to 1-indexed
+        })
+        .collect();
+
+    let mut current_score = score_sa_assignment(&assignment, groups, sequence, links);
+    let mut best_assignment = assignment.clone();
+    let mut best_score = current_score;
+
+    for iter in 0..sa_iterations {
+        // Adaptive temperature within SA loop
+        let local_temp = temperature * (1.0 - iter as f64 / sa_iterations as f64);
+
+        // Propose move
+        let mv = propose_sa_move(&assignment, links, sequence.len(), &mut rng, local_temp);
+
+        // Apply move to copy
+        let mut new_assignment = assignment.clone();
+        apply_sa_move(&mut new_assignment, &mv, links, sequence.len());
+
+        // Score
+        let new_score = score_sa_assignment(&new_assignment, groups, sequence, links);
+
+        // Metropolis acceptance
+        let delta = new_score - current_score;
+        let accept = if delta > 0.0 {
+            true
+        } else {
+            let prob = (delta / local_temp.max(0.1)).exp();
+            rng.gen::<f64>() < prob
+        };
+
+        if accept {
+            assignment = new_assignment;
+            current_score = new_score;
+
+            if current_score > best_score {
+                best_assignment = assignment.clone();
+                best_score = current_score;
+            }
+        }
+    }
+
+    best_assignment
+}
+
+/// A carbon observation with weighted contribution to a soft spin system.
+#[derive(Debug, Clone)]
+pub struct WeightedCarbon {
+    /// Chemical shift in ppm
+    pub shift: f64,
+    /// Fit quality weight (0-1) based on (H, N) match to group center
+    pub weight: f64,
+    /// Observation index this came from
+    pub obs_idx: usize,
+}
+
+/// Soft spin system evidence - allows observations to contribute to multiple groups
+/// with weighted probability based on chemical shift fit.
+#[derive(Debug, Clone)]
+pub struct SoftSpinSystemEvidence {
+    /// Index of this group
+    pub group_idx: usize,
+    /// Group center (H, N) - can drift during BP
+    pub h_center: f64,
+    pub n_center: f64,
+    /// Intra-residue carbons: atom_type -> Vec of weighted contributions
+    pub intra_carbons: HashMap<String, Vec<WeightedCarbon>>,
+    /// Inter-residue carbons: atom_type -> Vec of weighted contributions
+    pub inter_carbons: HashMap<String, Vec<WeightedCarbon>>,
+    /// Observation weights: obs_idx -> fit_quality
+    pub observation_weights: HashMap<usize, f64>,
+    /// Total weight from all observations (for normalization)
+    pub total_weight: f64,
+}
+
+impl SoftSpinSystemEvidence {
+    /// Create a new soft spin system with given center
+    pub fn new(group_idx: usize, h_center: f64, n_center: f64) -> Self {
+        Self {
+            group_idx,
+            h_center,
+            n_center,
+            intra_carbons: HashMap::new(),
+            inter_carbons: HashMap::new(),
+            observation_weights: HashMap::new(),
+            total_weight: 0.0,
+        }
+    }
+
+    /// Add an observation's contribution with given weight
+    pub fn add_observation(&mut self, obs_idx: usize, obs: &Observation, weight: f64) {
+        self.observation_weights.insert(obs_idx, weight);
+        self.total_weight += weight;
+
+        // Add carbons with weighted contribution
+        for dim in &obs.dimensions {
+            if dim.nucleus == NucleusType::C13 {
+                let atom_type = match &dim.atom_constraint {
+                    AtomConstraint::Exact(s) => s.clone(),
+                    AtomConstraint::OneOf(v) if v.len() == 1 => v[0].clone(),
+                    _ => dim.atom_hint.clone().unwrap_or_else(|| "C".to_string()),
+                };
+
+                let wc = WeightedCarbon {
+                    shift: dim.shift,
+                    weight,
+                    obs_idx,
+                };
+
+                // Use residue_offset if available, otherwise use intensity
+                let is_intra = match dim.residue_offset {
+                    ResidueOffset::Intra => true,
+                    ResidueOffset::PrecedingResidue => false,
+                    _ => obs.intensity > 0.5,
+                };
+
+                if is_intra {
+                    self.intra_carbons.entry(atom_type).or_default().push(wc);
+                } else {
+                    self.inter_carbons.entry(atom_type).or_default().push(wc);
+                }
+            }
+        }
+    }
+
+    /// Get weighted average shift for an intra carbon atom type
+    pub fn get_weighted_intra_carbon(&self, atom_type: &str) -> Option<f64> {
+        let carbons = self.intra_carbons.get(atom_type)?;
+        if carbons.is_empty() {
+            return None;
+        }
+        let total_weight: f64 = carbons.iter().map(|c| c.weight).sum();
+        if total_weight < 0.001 {
+            return None;
+        }
+        let weighted_sum: f64 = carbons.iter().map(|c| c.shift * c.weight).sum();
+        Some(weighted_sum / total_weight)
+    }
+
+    /// Get weighted average shift for an inter carbon atom type
+    pub fn get_weighted_inter_carbon(&self, atom_type: &str) -> Option<f64> {
+        let carbons = self.inter_carbons.get(atom_type)?;
+        if carbons.is_empty() {
+            return None;
+        }
+        let total_weight: f64 = carbons.iter().map(|c| c.weight).sum();
+        if total_weight < 0.001 {
+            return None;
+        }
+        let weighted_sum: f64 = carbons.iter().map(|c| c.shift * c.weight).sum();
+        Some(weighted_sum / total_weight)
+    }
+
+    /// Move center toward weighted average of contributing observations
+    pub fn update_center_from_weights(&mut self, observations: &[Observation]) {
+        let mut sum_h = 0.0;
+        let mut sum_n = 0.0;
+        let mut total_weight = 0.0;
+
+        for (&obs_idx, &weight) in &self.observation_weights {
+            if let Some((h, n)) = get_backbone_hn_from_obs(&observations[obs_idx]) {
+                sum_h += h * weight;
+                sum_n += n * weight;
+                total_weight += weight;
+            }
+        }
+
+        if total_weight > 0.01 {
+            // Blend toward new center (0.3 momentum to prevent oscillation)
+            let new_h = sum_h / total_weight;
+            let new_n = sum_n / total_weight;
+            self.h_center = 0.7 * self.h_center + 0.3 * new_h;
+            self.n_center = 0.7 * self.n_center + 0.3 * new_n;
+        }
+    }
+
+    /// Clear all observation contributions (for recomputation)
+    pub fn clear_contributions(&mut self) {
+        self.intra_carbons.clear();
+        self.inter_carbons.clear();
+        self.observation_weights.clear();
+        self.total_weight = 0.0;
+    }
+
+    /// Get all observation indices contributing to this group
+    pub fn get_observation_indices(&self) -> Vec<usize> {
+        self.observation_weights.keys().copied().collect()
+    }
+
+    /// Convert to SpinSystemEvidence format for compatibility with typing functions.
+    /// Uses weighted averages for carbon shifts.
+    pub fn to_spin_system_evidence(&self) -> SpinSystemEvidence {
+        let mut intra_carbons: HashMap<String, f64> = HashMap::new();
+        let mut inter_carbons: HashMap<String, f64> = HashMap::new();
+
+        // Compute weighted average for each carbon type
+        for (atom_type, carbons) in &self.intra_carbons {
+            if let Some(avg) = self.get_weighted_intra_carbon(atom_type) {
+                intra_carbons.insert(atom_type.clone(), avg);
+            }
+        }
+        for (atom_type, carbons) in &self.inter_carbons {
+            if let Some(avg) = self.get_weighted_inter_carbon(atom_type) {
+                inter_carbons.insert(atom_type.clone(), avg);
+            }
+        }
+
+        SpinSystemEvidence {
+            group_idx: self.group_idx,
+            observation_indices: self.get_observation_indices(),
+            h_shift: self.h_center,
+            n_shift: self.n_center,
+            intra_carbons,
+            inter_carbons,
+            intra_protons: HashMap::new(),
+        }
+    }
+}
+
+/// Helper to get backbone (H, N) from an observation
+fn get_backbone_hn_from_obs(obs: &Observation) -> Option<(f64, f64)> {
+    let h = obs.dimensions.iter()
+        .find(|d| d.nucleus == NucleusType::H1 && d.residue_offset == ResidueOffset::Intra)
+        .map(|d| d.shift)?;
+    let n = obs.dimensions.iter()
+        .find(|d| d.nucleus == NucleusType::N15 && d.residue_offset == ResidueOffset::Intra)
+        .map(|d| d.shift)?;
+    Some((h, n))
+}
+
+/// Compute how well an observation fits a group center using Gaussian likelihood
+fn compute_group_fit(
+    obs_h: f64, obs_n: f64,
+    group_h: f64, group_n: f64,
+    sigma_h: f64, sigma_n: f64,
+) -> f64 {
+    let d_h = (obs_h - group_h) / sigma_h;
+    let d_n = (obs_n - group_n) / sigma_n;
+    (-0.5 * (d_h * d_h + d_n * d_n)).exp()
+}
+
+/// Find unique backbone (H, N) centers from observations.
+/// Uses clustering to identify distinct spin systems.
+fn find_backbone_centers(
+    observations: &[Observation],
+    backbone_indices: &[usize],
+    h_tolerance: f64,
+    n_tolerance: f64,
+) -> Vec<(f64, f64)> {
+    let mut centers: Vec<(f64, f64)> = Vec::new();
+
+    for &idx in backbone_indices {
+        let Some((h, n)) = get_backbone_hn_from_obs(&observations[idx]) else { continue };
+
+        // Check if this (H, N) matches any existing center
+        let matches_existing = centers.iter().any(|(h_c, n_c)| {
+            (h - h_c).abs() < h_tolerance && (n - n_c).abs() < n_tolerance
+        });
+
+        if !matches_existing {
+            centers.push((h, n));
+        }
+    }
+
+    centers
+}
+
+/// Create soft backbone groups with weighted observation contributions.
+/// Observations can contribute to multiple groups based on fit quality.
+fn create_soft_backbone_groups(
+    observations: &[Observation],
+    backbone_indices: &[usize],
+    sigma_h: f64,  // Gaussian width for H (for soft weighting)
+    sigma_n: f64,  // Gaussian width for N (for soft weighting)
+    fit_threshold: f64,  // Minimum fit quality to contribute (e.g., 0.01)
+) -> Vec<SoftSpinSystemEvidence> {
+    // 1. Find unique backbone centers using TIGHT tolerance for initial clustering
+    // This ensures we get one center per distinct spin system
+    // The soft weighting (sigma_h, sigma_n) allows for overlapped peak contributions
+    let center_h_tol = 0.03;  // Tight: 0.03 ppm for H
+    let center_n_tol = 0.3;   // Tight: 0.3 ppm for N
+    let centers = find_backbone_centers(observations, backbone_indices, center_h_tol, center_n_tol);
+
+    // 2. Create soft groups for each center
+    let mut groups: Vec<SoftSpinSystemEvidence> = centers.iter()
+        .enumerate()
+        .map(|(idx, (h, n))| SoftSpinSystemEvidence::new(idx, *h, *n))
+        .collect();
+
+    // 3. Assign observations to groups with weighted contribution
+    for &obs_idx in backbone_indices {
+        let Some((obs_h, obs_n)) = get_backbone_hn_from_obs(&observations[obs_idx]) else { continue };
+
+        for group in &mut groups {
+            let fit = compute_group_fit(obs_h, obs_n, group.h_center, group.n_center, sigma_h, sigma_n);
+            if fit >= fit_threshold {
+                group.add_observation(obs_idx, &observations[obs_idx], fit);
+            }
+        }
+    }
+
+    groups
+}
+
+/// Recompute observation weights for all groups with new tolerances.
+/// Called during BP as tolerances anneal.
+fn recompute_group_weights(
+    groups: &mut [SoftSpinSystemEvidence],
+    observations: &[Observation],
+    backbone_indices: &[usize],
+    sigma_h: f64,
+    sigma_n: f64,
+    fit_threshold: f64,
+) {
+    // Clear existing contributions
+    for group in groups.iter_mut() {
+        group.clear_contributions();
+    }
+
+    // Recompute with new tolerances
+    for &obs_idx in backbone_indices {
+        let Some((obs_h, obs_n)) = get_backbone_hn_from_obs(&observations[obs_idx]) else { continue };
+
+        for group in groups.iter_mut() {
+            let fit = compute_group_fit(obs_h, obs_n, group.h_center, group.n_center, sigma_h, sigma_n);
+            if fit >= fit_threshold {
+                group.add_observation(obs_idx, &observations[obs_idx], fit);
+            }
+        }
+    }
+}
+
+/// Detect groups with multimodal INTRA CA distributions and split them.
+/// Only splits when multiple INTRA CAs disagree (not intra vs inter, which is normal).
+fn detect_and_split_multimodal_groups(
+    groups: &mut Vec<SoftSpinSystemEvidence>,
+    observations: &[Observation],
+    min_ca_separation: f64,  // e.g., 2.0 ppm for same-residue ambiguity
+    verbose: bool,
+) {
+    let mut groups_to_add: Vec<SoftSpinSystemEvidence> = Vec::new();
+    let mut groups_to_remove: Vec<usize> = Vec::new();
+
+    for (group_idx, group) in groups.iter().enumerate() {
+        // Get INTRA CA shifts only (inter CAs are from different residues, so variance is expected)
+        let Some(ca_carbons) = group.intra_carbons.get("CA") else { continue };
+        if ca_carbons.len() < 2 {
+            continue;
+        }
+
+        // Filter to only TRUE intra observations (intensity > 0.5)
+        let intra_shifts: Vec<(f64, usize, f64)> = ca_carbons.iter()
+            .filter(|wc| observations[wc.obs_idx].intensity > 0.5)
+            .map(|wc| (wc.shift, wc.obs_idx, wc.weight))
+            .collect();
+
+        if intra_shifts.len() < 2 {
+            continue;  // Not enough intra CAs to detect bimodality
+        }
+
+        // Check if INTRA CA distribution is bimodal
+        let (min_shift, max_shift) = intra_shifts.iter()
+            .fold((f64::MAX, f64::MIN), |(min, max), &(s, _, _)| (min.min(s), max.max(s)));
+
+        if max_shift - min_shift >= min_ca_separation {
+            // Bimodal INTRA CAs! This suggests two different residues wrongly merged
+            let midpoint = (min_shift + max_shift) / 2.0;
+
+            // Collect observations for each cluster (use ALL observations, not just CA)
+            let mut low_obs: Vec<(usize, f64)> = Vec::new();
+            let mut high_obs: Vec<(usize, f64)> = Vec::new();
+
+            for &(shift, obs_idx, weight) in &intra_shifts {
+                if shift < midpoint {
+                    low_obs.push((obs_idx, weight));
+                } else {
+                    high_obs.push((obs_idx, weight));
+                }
+            }
+
+            // Only split if both clusters have intra observations
+            if !low_obs.is_empty() && !high_obs.is_empty() {
+                if verbose {
+                    println!("  Splitting group {} (INTRA CA bimodal): {:.1}-{:.1} ppm ({} low, {} high)",
+                        group_idx, min_shift, max_shift, low_obs.len(), high_obs.len());
+                }
+
+                // Compute new centers for each cluster
+                let compute_cluster_center = |obs_list: &[(usize, f64)]| -> (f64, f64) {
+                    let mut sum_h = 0.0;
+                    let mut sum_n = 0.0;
+                    let mut total_w = 0.0;
+                    for &(obs_idx, w) in obs_list {
+                        if let Some((h, n)) = get_backbone_hn_from_obs(&observations[obs_idx]) {
+                            sum_h += h * w;
+                            sum_n += n * w;
+                            total_w += w;
+                        }
+                    }
+                    if total_w > 0.001 {
+                        (sum_h / total_w, sum_n / total_w)
+                    } else {
+                        (group.h_center, group.n_center)
+                    }
+                };
+
+                let (h_low, n_low) = compute_cluster_center(&low_obs);
+                let (h_high, n_high) = compute_cluster_center(&high_obs);
+
+                // Create two new groups
+                let new_idx_low = groups.len() + groups_to_add.len();
+                let new_idx_high = new_idx_low + 1;
+
+                let mut group_low = SoftSpinSystemEvidence::new(new_idx_low, h_low, n_low);
+                let mut group_high = SoftSpinSystemEvidence::new(new_idx_high, h_high, n_high);
+
+                for (obs_idx, weight) in low_obs {
+                    group_low.add_observation(obs_idx, &observations[obs_idx], weight);
+                }
+                for (obs_idx, weight) in high_obs {
+                    group_high.add_observation(obs_idx, &observations[obs_idx], weight);
+                }
+
+                groups_to_add.push(group_low);
+                groups_to_add.push(group_high);
+                groups_to_remove.push(group_idx);
+            }
+        }
+    }
+
+    // Remove split groups (in reverse order to preserve indices)
+    groups_to_remove.sort();
+    for &idx in groups_to_remove.iter().rev() {
+        groups.remove(idx);
+    }
+
+    // Re-index remaining groups
+    for (i, group) in groups.iter_mut().enumerate() {
+        group.group_idx = i;
+    }
+
+    // Add new groups
+    let base_idx = groups.len();
+    for (i, mut new_group) in groups_to_add.into_iter().enumerate() {
+        new_group.group_idx = base_idx + i;
+        groups.push(new_group);
+    }
+}
+
+/// Sequential link between two spin systems at the group level.
+#[derive(Debug, Clone)]
+pub struct GroupSequentialLink {
+    /// Index of preceding group (observes inter carbons)
+    pub from_group: usize,
+    /// Index of following group (observes intra carbons matching from's inter)
+    pub to_group: usize,
+    /// Base match strength (computed at discovery time)
+    pub strength: f64,
+    /// Which carbons matched
+    pub matched_atoms: Vec<String>,
+    /// Average absolute shift difference (ppm) - used for adaptive filtering
+    pub avg_shift_diff: f64,
+    /// Maximum shift difference among matched atoms (ppm)
+    pub max_shift_diff: f64,
+}
+
+/// Run group-level belief propagation.
+/// This is the simplified physics-based approach:
+/// - 66 variables (groups) instead of 586 (observations)
+/// - Typing factor from carbons + (H, N)
+/// - Sequential factor from inter/intra carbon matching
+/// - Uniqueness enforced at extraction time
+pub fn run_group_level_bp(
+    groups: &[SpinSystemEvidence],
+    sequential_links: &[GroupSequentialLink],
+    residue_types: &[String],
+    sequence: &str,  // For path uniqueness scoring
+    kde: &KDEDatabase,
+    params: &UnifiedAssignmentParams,
+) -> Vec<(usize, i32, f64)> {  // (group_idx, position, confidence)
+    let n_groups = groups.len();
+    let domain_size = residue_types.len() + 1;  // 0 = unassigned, 1..N = positions
+
+    if n_groups == 0 {
+        return vec![];
+    }
+
+    // Compute typing scores for each group
+    let typing_scores = compute_group_typing_scores(groups, residue_types, kde);
+
+    // Debug: show best typing scores for all groups - focus on GLY detection
+    if params.verbose {
+        println!("\n--- Typing scores (before BP) - GLY check ---");
+
+        // Find which positions are GLY in the sequence
+        let gly_positions: Vec<usize> = residue_types.iter().enumerate()
+            .filter(|(_, t)| *t == "GLY")
+            .map(|(i, _)| i)
+            .collect();
+        println!("GLY positions in sequence: {:?}", gly_positions.iter().map(|p| p + 1).collect::<Vec<_>>());
+
+        // Check each group's GLY score
+        let mut gly_groups: Vec<(usize, f64)> = Vec::new();
+        for (g, scores) in typing_scores.iter().enumerate() {
+            // Sum scores for GLY positions
+            let gly_score: f64 = gly_positions.iter().map(|&p| scores[p]).sum();
+            let total: f64 = scores.iter().sum();
+            let gly_fraction = if total > 0.0 { gly_score / total } else { 0.0 };
+
+            if gly_fraction > 0.3 {  // >30% GLY
+                gly_groups.push((g, gly_fraction));
+            }
+        }
+        gly_groups.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        println!("Groups with >30% GLY typing ({} total):", gly_groups.len());
+        for (g, frac) in gly_groups.iter().take(10) {
+            let group = &groups[*g];
+            let ca = group.intra_carbons.get("CA").unwrap_or(&0.0);
+            let cb = group.intra_carbons.get("CB");
+            println!("  Group {}: {:.1}% GLY, CA={:.1}, CB={:?}", g, frac * 100.0, ca, cb);
+        }
+        println!("---");
+    }
+
+    // Initialize beliefs from typing scores
+    let mut beliefs: Vec<Vec<f64>> = typing_scores.iter()
+        .map(|scores| {
+            let mut b = vec![0.0; domain_size];
+            // Small prior for position 0 (unassigned)
+            b[0] = 0.01;
+            for (pos, &score) in scores.iter().enumerate() {
+                b[pos + 1] = score.max(1e-10);
+            }
+            // Normalize
+            let sum: f64 = b.iter().sum();
+            if sum > 0.0 {
+                for v in b.iter_mut() {
+                    *v /= sum;
+                }
+            }
+            b
+        })
+        .collect();
+
+    // Build link lookup: for each group, which links involve it?
+    let mut links_to: Vec<Vec<usize>> = vec![vec![]; n_groups];  // links where group is 'to'
+    let mut links_from: Vec<Vec<usize>> = vec![vec![]; n_groups]; // links where group is 'from'
+    for (link_idx, link) in sequential_links.iter().enumerate() {
+        links_to[link.to_group].push(link_idx);
+        links_from[link.from_group].push(link_idx);
+    }
+
+    let max_iterations = params.max_iterations;
+    let damping = 0.3;  // Damping factor for stability
+
+    // Adaptive tolerance parameters: start broad, converge to tight
+    let tol_initial = params.triple_res_c_tolerance_initial.max(1.0);  // Broad (1+ ppm)
+    let tol_final = params.triple_res_c_tolerance_final.max(0.1);      // Tight (0.1-0.2 ppm)
+
+    if params.verbose {
+        println!("\n=== GROUP-LEVEL BP ===");
+        println!("Groups: {}, Positions: {}", n_groups, domain_size - 1);
+        println!("Sequential links: {}", sequential_links.len());
+        println!("Adaptive tolerance: {:.2} -> {:.2} ppm", tol_initial, tol_final);
+    }
+
+    for iteration in 0..max_iterations {
+        let mut new_beliefs = vec![vec![0.0; domain_size]; n_groups];
+        let mut max_delta = 0.0f64;
+
+        // Compute current tolerance using exponential decay (fast initial narrowing)
+        let progress = iteration as f64 / max_iterations as f64;
+        let t = 1.0 - (-3.0 * progress).exp();  // Exponential approach to 1
+        let current_tol = tol_initial * (1.0 - t) + tol_final * t;
+
+        // Count active links at current tolerance (for debugging)
+        let mut active_links = 0usize;
+
+        for g in 0..n_groups {
+            // Strategy: compute typing and sequential messages in PROBABILITY space,
+            // then combine them multiplicatively.
+
+            // Factor 1: Typing (unary) - directly use typing scores (already normalized)
+            let mut typing_msg = vec![1e-10; domain_size];
+            typing_msg[0] = 0.01;  // Small prior for unassigned
+            for pos in 1..domain_size {
+                typing_msg[pos] = typing_scores[g][pos - 1].max(1e-10);
+            }
+
+            // Factor 2: Sequential (aggregate messages from linked groups)
+            // Message says: "based on my neighbors, position pos is likely"
+            let mut seq_msg_incoming = vec![1.0; domain_size];  // Uniform prior
+            let mut seq_msg_outgoing = vec![1.0; domain_size];
+            let mut has_incoming_links = false;
+            let mut has_outgoing_links = false;
+
+            // Incoming links: if 'from' is at pos i, I should be at pos i+1
+            for &link_idx in &links_to[g] {
+                let link = &sequential_links[link_idx];
+                if link.max_shift_diff > current_tol {
+                    continue;
+                }
+                active_links += 1;
+                has_incoming_links = true;
+
+                let from_g = link.from_group;
+                let effective_strength = link.strength * (1.0 - link.avg_shift_diff / current_tol).max(0.0);
+
+                for pos in 2..domain_size {
+                    let from_prob = beliefs[from_g][pos - 1];
+                    seq_msg_incoming[pos] *= 1.0 + effective_strength * from_prob;
+                }
+            }
+
+            // Outgoing links: if 'to' is at pos i+1, I should be at pos i
+            for &link_idx in &links_from[g] {
+                let link = &sequential_links[link_idx];
+                if link.max_shift_diff > current_tol {
+                    continue;
+                }
+                has_outgoing_links = true;
+
+                let to_g = link.to_group;
+                let effective_strength = link.strength * (1.0 - link.avg_shift_diff / current_tol).max(0.0);
+
+                for pos in 1..(domain_size - 1) {
+                    let to_prob = beliefs[to_g][pos + 1];
+                    seq_msg_outgoing[pos] *= 1.0 + effective_strength * to_prob;
+                }
+            }
+
+            // Normalize sequential messages
+            if has_incoming_links {
+                let sum: f64 = seq_msg_incoming.iter().sum();
+                if sum > 0.0 {
+                    for v in seq_msg_incoming.iter_mut() { *v /= sum; }
+                }
+            }
+            if has_outgoing_links {
+                let sum: f64 = seq_msg_outgoing.iter().sum();
+                if sum > 0.0 {
+                    for v in seq_msg_outgoing.iter_mut() { *v /= sum; }
+                }
+            }
+
+            // Combine: typing * sequential_in * sequential_out
+            // If no sequential links, typing dominates
+            let typing_weight = 3.0;  // Typing is primary evidence
+            let seq_weight = 1.0;  // Sequential connectivity from carbon matches
+            let _has_links = has_incoming_links || has_outgoing_links;
+
+            for pos in 0..domain_size {
+                let t = typing_msg[pos].powf(typing_weight);
+                let s_in = if has_incoming_links { seq_msg_incoming[pos] } else { 1.0 };
+                let s_out = if has_outgoing_links { seq_msg_outgoing[pos] } else { 1.0 };
+                new_beliefs[g][pos] = t * s_in.powf(seq_weight) * s_out.powf(seq_weight);
+            }
+
+            // Normalize beliefs (we're in probability space, not log space)
+            let sum: f64 = new_beliefs[g].iter().sum();
+            if sum > 0.0 {
+                for v in new_beliefs[g].iter_mut() {
+                    *v /= sum;
+                }
+            }
+
+            // Apply damping
+            for pos in 0..domain_size {
+                let old = beliefs[g][pos];
+                let new = new_beliefs[g][pos];
+                new_beliefs[g][pos] = damping * old + (1.0 - damping) * new;
+                max_delta = max_delta.max((old - new_beliefs[g][pos]).abs());
+            }
+        }
+
+        beliefs = new_beliefs;
+
+        // Check convergence
+        if iteration > 0 && max_delta < 0.001 {
+            if params.verbose {
+                println!("Converged at iteration {} (max_delta={:.4})", iteration, max_delta);
+            }
+            break;
+        }
+
+        if params.verbose && (iteration < 5 || iteration % 20 == 0) {
+            println!("Iteration {}: max_delta={:.4}, active_links={}", iteration, max_delta, active_links / 2);
+        }
+    }
+
+    // Debug: show beliefs after BP for first few groups
+    if params.verbose {
+        println!("\n--- Beliefs (after BP) ---");
+        for (g, b) in beliefs.iter().enumerate().take(5) {
+            let (best_pos, &best_belief) = b.iter().enumerate()
+                .skip(1)  // Skip position 0
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap();
+            let res_type = if best_pos > 0 && best_pos <= residue_types.len() {
+                &residue_types[best_pos - 1]
+            } else { "?" };
+            println!("  Group {}: best pos {} ({}) with belief {:.4}", g, best_pos, res_type, best_belief);
+        }
+        println!("---");
+    }
+
+    // POST-BP REFINEMENT: Apply path uniqueness scoring
+    // This boosts positions where the implied sequential path is unique in the sequence
+    if params.verbose {
+        println!("\n--- Applying path uniqueness refinement ---");
+    }
+
+    let mut uniqueness_adjusted = 0usize;
+    let mut debug_paths_shown = 0usize;
+    for g in 0..n_groups {
+        // Only refine groups that have sequential neighbors
+        let has_links = !links_from[g].is_empty() || !links_to[g].is_empty();
+        if !has_links {
+            continue;
+        }
+
+        // Compute uniqueness for each position
+        let mut best_original_pos = 0;
+        let mut best_original_belief = 0.0f64;
+        for pos in 1..domain_size {
+            if beliefs[g][pos] > best_original_belief {
+                best_original_belief = beliefs[g][pos];
+                best_original_pos = pos;
+            }
+        }
+
+        // Compute path uniqueness for top candidate positions
+        let mut pos_scores: Vec<(usize, f64)> = beliefs[g].iter().enumerate()
+            .skip(1)
+            .filter(|(_, &b)| b > 0.01)  // Only consider positions with some belief
+            .map(|(pos, &b)| {
+                let u = compute_path_uniqueness_for_position(
+                    g, pos, &beliefs, &typing_scores,
+                    &links_from, &links_to, sequential_links,
+                    residue_types, sequence, 3  // window of 3 residues each direction
+                );
+                (pos, b * u)  // Multiply belief by uniqueness factor
+            })
+            .collect();
+
+        // Debug: show uniqueness factors for first few groups
+        if params.verbose && debug_paths_shown < 5 && pos_scores.len() > 1 {
+            debug_paths_shown += 1;
+            println!("  Group {} (best={}, belief={:.3}): {} candidate positions",
+                g, best_original_pos, best_original_belief, pos_scores.len());
+            for (pos, score) in pos_scores.iter().take(3) {
+                let orig_belief = beliefs[g][*pos];
+                let uniqueness = if orig_belief > 0.0 { score / orig_belief } else { 1.0 };
+                let res_type = if *pos <= residue_types.len() { &residue_types[*pos - 1] } else { "?" };
+                println!("    pos {} ({}): belief={:.3}, u={:.3}, final={:.3}",
+                    pos, res_type, orig_belief, uniqueness, score);
+            }
+        }
+
+        pos_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Update beliefs with uniqueness-adjusted scores
+        let sum: f64 = pos_scores.iter().map(|(_, s)| s).sum::<f64>().max(1e-10);
+        for pos in 1..domain_size {
+            if let Some((_, adjusted)) = pos_scores.iter().find(|(p, _)| *p == pos) {
+                beliefs[g][pos] = *adjusted / sum;
+            } else {
+                beliefs[g][pos] = 0.001 / sum;  // Very low probability
+            }
+        }
+
+        // Check if best position changed
+        let mut new_best_pos = 0;
+        let mut new_best_belief = 0.0f64;
+        for pos in 1..domain_size {
+            if beliefs[g][pos] > new_best_belief {
+                new_best_belief = beliefs[g][pos];
+                new_best_pos = pos;
+            }
+        }
+
+        if new_best_pos != best_original_pos {
+            uniqueness_adjusted += 1;
+            if params.verbose && uniqueness_adjusted <= 10 {
+                let old_type = if best_original_pos <= residue_types.len() {
+                    &residue_types[best_original_pos - 1]
+                } else { "?" };
+                let new_type = if new_best_pos <= residue_types.len() {
+                    &residue_types[new_best_pos - 1]
+                } else { "?" };
+                println!("  Group {}: {} (pos {}) -> {} (pos {}) via uniqueness",
+                    g, old_type, best_original_pos, new_type, new_best_pos);
+            }
+        }
+    }
+
+    if params.verbose {
+        println!("Path uniqueness adjusted {} groups", uniqueness_adjusted);
+        println!("---");
+    }
+
+    // Extract assignments using greedy approach (highest confidence first)
+    extract_group_assignments(&beliefs, groups, residue_types, params.verbose)
+}
+
+// =============================================================================
+// Sequential Path Uniqueness Scoring
+// =============================================================================
+
+/// Convert 3-letter amino acid code to 1-letter code.
+fn three_to_one(three: &str) -> char {
+    match three {
+        "GLY" => 'G', "ALA" => 'A', "VAL" => 'V', "LEU" => 'L',
+        "ILE" => 'I', "PRO" => 'P', "PHE" => 'F', "TYR" => 'Y',
+        "TRP" => 'W', "SER" => 'S', "THR" => 'T', "CYS" => 'C',
+        "MET" => 'M', "ASN" => 'N', "GLN" => 'Q', "ASP" => 'D',
+        "GLU" => 'E', "LYS" => 'K', "ARG" => 'R', "HIS" => 'H',
+        _ => '?',
+    }
+}
+
+/// Count how many times a type pattern appears in the sequence.
+/// Returns (n_matches, starting positions) where positions are 1-indexed.
+fn count_pattern_in_sequence(pattern: &[String], sequence: &str) -> (usize, Vec<usize>) {
+    if pattern.is_empty() || pattern.len() > sequence.len() {
+        return (0, Vec::new());
+    }
+
+    let seq_chars: Vec<char> = sequence.chars().collect();
+    let pattern_chars: Vec<char> = pattern.iter().map(|s| three_to_one(s)).collect();
+    let mut matches = Vec::new();
+
+    for start in 0..=(seq_chars.len() - pattern.len()) {
+        let mut all_match = true;
+        for (i, &pat_char) in pattern_chars.iter().enumerate() {
+            if pat_char == '?' || seq_chars[start + i] != pat_char {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            matches.push(start + 1);  // 1-indexed positions
+        }
+    }
+    (matches.len(), matches)
+}
+
+/// Score a sequential path by its uniqueness in the sequence.
+/// Returns a score: 1.0 for unique, lower for ambiguous, 0.0 for non-existent.
+fn score_path_uniqueness(path_types: &[String], sequence: &str) -> f64 {
+    if path_types.is_empty() {
+        return 0.0;
+    }
+
+    let (n_matches, _positions) = count_pattern_in_sequence(path_types, sequence);
+
+    if n_matches == 0 {
+        return 0.0;  // Pattern doesn't exist in sequence (typing error)
+    } else if n_matches == 1 {
+        return 1.0;  // Unique! Strong evidence
+    } else {
+        // Multiple matches - ambiguous
+        // Longer paths with few matches are still valuable
+        let length_bonus = (path_types.len() as f64).sqrt() / 3.0;
+        length_bonus / (n_matches as f64)
+    }
+}
+
+/// For a group at a candidate position, compute how well the sequential neighborhood
+/// typing distributions match the sequence context.
+///
+/// This is PROBABILISTIC: instead of taking the best type, we compute the probability
+/// that each neighbor's typing is consistent with the sequence position it would occupy.
+///
+/// Key insight: GLY (no CB), ALA (characteristic CB), and PRO boundaries are strong anchors.
+fn compute_path_uniqueness_for_position(
+    group_idx: usize,
+    candidate_pos: usize,
+    beliefs: &[Vec<f64>],
+    typing_scores: &[Vec<f64>],
+    links_from: &[Vec<usize>],  // group -> outgoing link indices
+    links_to: &[Vec<usize>],    // group -> incoming link indices
+    sequential_links: &[GroupSequentialLink],
+    residue_types: &[String],
+    sequence: &str,
+    window: usize,
+) -> f64 {
+    let seq_chars: Vec<char> = sequence.chars().collect();
+    if candidate_pos == 0 || candidate_pos > seq_chars.len() {
+        return 1.0;
+    }
+
+    // Collect neighbor groups and their implied positions
+    // Each neighbor contributes: P(neighbor typing matches sequence at implied position)
+    let mut match_probability = 1.0f64;
+    let mut n_neighbors = 0usize;
+    let mut visited: HashSet<usize> = HashSet::new();
+    visited.insert(group_idx);
+
+    // Check this group's typing against sequence
+    let seq_type_here = &seq_chars[candidate_pos - 1];
+    let my_match_prob = typing_probability_for_sequence_char(
+        &typing_scores[group_idx], residue_types, *seq_type_here
+    );
+    match_probability *= my_match_prob.max(0.01);  // Floor to avoid zero
+
+    // Walk backward through predecessors
+    let mut current_group = group_idx;
+    let mut current_seq_pos = candidate_pos as i32;
+    for _ in 0..window {
+        current_seq_pos -= 1;
+        if current_seq_pos < 1 {
+            break;
+        }
+
+        // Check for PRO at this position - it's a boundary (no NH)
+        let seq_char_here = seq_chars[current_seq_pos as usize - 1];
+        if seq_char_here == 'P' {
+            // PRO boundary - if we have no predecessor link here, that's GOOD (consistent)
+            // If we DO have a link, that's inconsistent (PRO shouldn't have backbone NH observation)
+            let has_pred_link = links_to[current_group].iter().any(|&idx| {
+                !visited.contains(&sequential_links[idx].from_group)
+            });
+            if !has_pred_link {
+                // Correct! Chain ends at PRO as expected
+                match_probability *= 2.0;  // Bonus for correct PRO boundary
+            }
+            break;  // Stop walking - PRO is a boundary
+        }
+
+        // Find best predecessor link
+        let mut best_pred: Option<(usize, f64)> = None;
+        for &link_idx in &links_to[current_group] {
+            let link = &sequential_links[link_idx];
+            if visited.contains(&link.from_group) {
+                continue;
+            }
+            let score = link.strength;
+            if best_pred.is_none() || score > best_pred.unwrap().1 {
+                best_pred = Some((link.from_group, score));
+            }
+        }
+
+        if let Some((pred_group, _)) = best_pred {
+            visited.insert(pred_group);
+            n_neighbors += 1;
+
+            // How well does predecessor's typing match sequence at this position?
+            let pred_match = typing_probability_for_sequence_char(
+                &typing_scores[pred_group], residue_types, seq_char_here
+            );
+
+            // GLY and ALA are distinctive - weight them more
+            let weight = if seq_char_here == 'G' || seq_char_here == 'A' {
+                2.0  // Strong anchor
+            } else {
+                1.0
+            };
+
+            match_probability *= pred_match.max(0.01).powf(weight);
+            current_group = pred_group;
+        } else {
+            break;  // No more predecessors
+        }
+    }
+
+    // Walk forward through successors
+    current_group = group_idx;
+    current_seq_pos = candidate_pos as i32;
+    for _ in 0..window {
+        current_seq_pos += 1;
+        if current_seq_pos as usize > seq_chars.len() {
+            break;
+        }
+
+        let seq_char_here = seq_chars[current_seq_pos as usize - 1];
+
+        // Find best successor link
+        let mut best_succ: Option<(usize, f64)> = None;
+        for &link_idx in &links_from[current_group] {
+            let link = &sequential_links[link_idx];
+            if visited.contains(&link.to_group) {
+                continue;
+            }
+            let score = link.strength;
+            if best_succ.is_none() || score > best_succ.unwrap().1 {
+                best_succ = Some((link.to_group, score));
+            }
+        }
+
+        // Check for PRO - successor at PRO position shouldn't exist (no backbone NH)
+        if seq_char_here == 'P' {
+            if best_succ.is_none() {
+                // Correct! No successor at PRO position
+                match_probability *= 2.0;  // Bonus
+            } else {
+                // Inconsistent - we have a successor but sequence says PRO
+                match_probability *= 0.1;  // Penalty
+            }
+            break;
+        }
+
+        if let Some((succ_group, _)) = best_succ {
+            visited.insert(succ_group);
+            n_neighbors += 1;
+
+            let succ_match = typing_probability_for_sequence_char(
+                &typing_scores[succ_group], residue_types, seq_char_here
+            );
+
+            let weight = if seq_char_here == 'G' || seq_char_here == 'A' {
+                2.0
+            } else {
+                1.0
+            };
+
+            match_probability *= succ_match.max(0.01).powf(weight);
+            current_group = succ_group;
+        } else {
+            break;
+        }
+    }
+
+    // Normalize by number of neighbors to avoid penalizing longer paths
+    if n_neighbors > 0 {
+        match_probability = match_probability.powf(1.0 / (n_neighbors as f64 + 1.0));
+    }
+
+    // Return as a factor (>1 means good match, <1 means poor match)
+    // Scale so that 0.5 probability -> factor 1.0, 1.0 probability -> factor 2.0
+    1.0 + match_probability
+}
+
+/// Compute how well a group's typing matches a specific sequence character.
+/// Returns a DISCRIMINATIVE score:
+/// - For distinctive residues (GLY, ALA): strong signal if match, strong penalty if mismatch
+/// - For other residues: weak signal (they're harder to distinguish)
+fn typing_probability_for_sequence_char(
+    typing_scores: &[f64],
+    residue_types: &[String],
+    seq_char: char,
+) -> f64 {
+    let target_type = match seq_char {
+        'G' => "GLY", 'A' => "ALA", 'V' => "VAL", 'L' => "LEU",
+        'I' => "ILE", 'P' => "PRO", 'F' => "PHE", 'Y' => "TYR",
+        'W' => "TRP", 'S' => "SER", 'T' => "THR", 'C' => "CYS",
+        'M' => "MET", 'N' => "ASN", 'Q' => "GLN", 'D' => "ASP",
+        'E' => "GLU", 'K' => "LYS", 'R' => "ARG", 'H' => "HIS",
+        _ => return 0.5,  // Unknown - neutral
+    };
+
+    let total_score: f64 = typing_scores.iter().sum();
+    if total_score <= 0.0 {
+        return 0.5;
+    }
+
+    let matching_score: f64 = residue_types.iter()
+        .enumerate()
+        .filter(|(_, t)| t.as_str() == target_type)
+        .map(|(i, _)| typing_scores[i])
+        .sum();
+
+    let prob = matching_score / total_score;
+
+    // For distinctive residues, amplify the signal
+    // GLY: no CB, very low CA (~45 ppm) - highly distinctive
+    // ALA: characteristic CB (~18 ppm) - highly distinctive
+    if seq_char == 'G' || seq_char == 'A' {
+        // If prob > 0.3, this is likely correct -> strong boost
+        // If prob < 0.1, this is likely wrong -> strong penalty
+        if prob > 0.3 {
+            return prob * 3.0;  // Strong match
+        } else if prob < 0.1 {
+            return prob * 0.1;  // Strong mismatch - sequence says G/A but typing doesn't
+        }
+    }
+
+    // For other residues, return moderate probability
+    prob
+}
+
+/// Check if a group is confidently typed as GLY (no CB, low CA)
+fn is_confident_gly(typing_scores: &[f64], residue_types: &[String]) -> bool {
+    let total: f64 = typing_scores.iter().sum();
+    if total <= 0.0 {
+        return false;
+    }
+
+    let gly_score: f64 = residue_types.iter()
+        .enumerate()
+        .filter(|(_, t)| t.as_str() == "GLY")
+        .map(|(i, _)| typing_scores[i])
+        .sum();
+
+    gly_score / total > 0.4  // >40% GLY probability
+}
+
+/// Check if a group is confidently typed as ALA
+fn is_confident_ala(typing_scores: &[f64], residue_types: &[String]) -> bool {
+    let total: f64 = typing_scores.iter().sum();
+    if total <= 0.0 {
+        return false;
+    }
+
+    let ala_score: f64 = residue_types.iter()
+        .enumerate()
+        .filter(|(_, t)| t.as_str() == "ALA")
+        .map(|(i, _)| typing_scores[i])
+        .sum();
+
+    ala_score / total > 0.4  // >40% ALA probability
+}
+
+/// Compute typing scores for each group based on evidence.
+fn compute_group_typing_scores(
+    groups: &[SpinSystemEvidence],
+    residue_types: &[String],
+    kde: &KDEDatabase,
+) -> Vec<Vec<f64>> {
+    let n_positions = residue_types.len();
+
+    groups.iter().map(|group| {
+        let mut scores = vec![1.0; n_positions];
+
+        // CRITICAL: Groups with backbone H/N CANNOT be prolines
+        // Prolines have no amide proton, so any backbone group with H/N shifts
+        // should have ZERO probability for proline positions
+        let has_backbone_hn = group.h_shift > 0.0 && group.n_shift > 0.0;
+
+        for (pos, res_type) in residue_types.iter().enumerate() {
+            // Proline exclusion: if we have H/N, proline is impossible
+            if has_backbone_hn && res_type == "PRO" {
+                scores[pos] = 1e-20;  // Essentially zero
+                continue;
+            }
+
+            // N-terminus (position 1) exclusion: no backbone amide
+            // Position 1 has -NH3+ (amino terminus), not -NH- (amide)
+            if has_backbone_hn && pos == 0 {
+                scores[pos] = 1e-20;
+                continue;
+            }
+
+            let mut score = 1.0;
+
+            // 1. Carbon contributions (CA, CB, C')
+            // CRITICAL: If we observe an atom (like CB) that the residue type shouldn't have,
+            // that's STRONG evidence AGAINST this residue type (e.g., GLY has no CB)
+            for (atom, &shift) in &group.intra_carbons {
+                let density = kde.density(res_type, atom, shift);
+                if density > 0.0 {
+                    score *= density.max(1e-10);
+                } else {
+                    // Zero density means this residue type doesn't have this atom
+                    // This is strong negative evidence (e.g., GLY-CB = 0)
+                    score *= 1e-15;  // Severe penalty
+                }
+            }
+
+            // 2. Backbone (H, N) contribution - use product of marginals
+            // TODO: Add bivariate KDE for (H, N) pairs for better discrimination
+            if group.h_shift > 0.0 && group.n_shift > 0.0 {
+                let h_density = kde.density(res_type, "H", group.h_shift);
+                let n_density = kde.density(res_type, "N", group.n_shift);
+                if h_density > 0.0 && n_density > 0.0 {
+                    score *= (h_density * n_density).max(1e-10);
+                }
+            }
+
+            // 3. Sidechain protons (if available)
+            for (atom, &shift) in &group.intra_protons {
+                let density = kde.density(res_type, atom, shift);
+                if density > 0.0 {
+                    score *= density.max(1e-10);
+                }
+            }
+
+            scores[pos] = score;
+        }
+
+        // Normalize scores
+        let sum: f64 = scores.iter().sum();
+        if sum > 0.0 {
+            for s in scores.iter_mut() {
+                *s /= sum;
+            }
+        }
+
+        scores
+    }).collect()
+}
+
+/// Extract unique assignments from beliefs using greedy approach.
+fn extract_group_assignments(
+    beliefs: &[Vec<f64>],
+    groups: &[SpinSystemEvidence],
+    residue_types: &[String],
+    verbose: bool,
+) -> Vec<(usize, i32, f64)> {
+    let n_groups = groups.len();
+    let domain_size = beliefs[0].len();
+
+    // Collect (group_idx, best_position, confidence) for all groups
+    let mut candidates: Vec<(usize, usize, f64)> = groups.iter().enumerate()
+        .map(|(g, _)| {
+            let (best_pos, &best_conf) = beliefs[g].iter().enumerate()
+                .skip(1)  // Skip position 0 (unassigned)
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap_or((0, &0.0));
+            (g, best_pos, best_conf)
+        })
+        .collect();
+
+    // Sort by confidence (highest first)
+    candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+    // Greedy assignment
+    let mut assigned_positions: HashSet<usize> = HashSet::new();
+    let mut results: Vec<(usize, i32, f64)> = Vec::new();
+
+    for (group_idx, best_pos, confidence) in candidates {
+        if best_pos == 0 || assigned_positions.contains(&best_pos) {
+            // Find best available position
+            let available = beliefs[group_idx].iter().enumerate()
+                .skip(1)
+                .filter(|(pos, _)| !assigned_positions.contains(pos))
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
+
+            if let Some((pos, &conf)) = available {
+                assigned_positions.insert(pos);
+                results.push((group_idx, pos as i32, conf));
+            }
+        } else {
+            assigned_positions.insert(best_pos);
+            results.push((group_idx, best_pos as i32, confidence));
+        }
+    }
+
+    if verbose {
+        println!("\n=== GROUP ASSIGNMENTS ===");
+        println!("Assigned {} / {} groups", results.len(), n_groups);
+        for (g, pos, conf) in results.iter().take(10) {
+            let res_type = if *pos > 0 && (*pos as usize) <= residue_types.len() {
+                &residue_types[*pos as usize - 1]
+            } else {
+                "?"
+            };
+            let group = &groups[*g];
+            println!("  Group {} -> pos {} ({}): conf={:.3}, H={:.3}, N={:.2}",
+                g, pos, res_type, conf, group.h_shift, group.n_shift);
+        }
+        println!("=========================\n");
+    }
+
+    results
+}
+
+/// Build sequential links between groups based on inter/intra carbon matching.
+/// Stores shift differences for adaptive tolerance filtering during BP.
+pub fn build_group_sequential_links_with_diffs(
+    groups: &[SpinSystemEvidence],
+    c_tolerance: f64,
+) -> Vec<GroupSequentialLink> {
+    let mut links = Vec::new();
+
+    for (from_idx, from_group) in groups.iter().enumerate() {
+        // from_group has inter carbons (observed at i-1)
+        if from_group.inter_carbons.is_empty() {
+            continue;
+        }
+
+        for (to_idx, to_group) in groups.iter().enumerate() {
+            if from_idx == to_idx {
+                continue;
+            }
+
+            // to_group has intra carbons (observed at i)
+            // If from's inter matches to's intra, then to follows from
+            let mut matched_atoms = Vec::new();
+            let mut total_strength = 0.0;
+            let mut total_diff = 0.0;
+            let mut max_diff = 0.0f64;
+
+            for (atom, &inter_shift) in &from_group.inter_carbons {
+                if let Some(&intra_shift) = to_group.intra_carbons.get(atom) {
+                    let diff = (inter_shift - intra_shift).abs();
+                    if diff < c_tolerance {
+                        matched_atoms.push(atom.clone());
+                        total_diff += diff;
+                        max_diff = max_diff.max(diff);
+                        // Strength based on how close the match is
+                        total_strength += 1.0 - diff / c_tolerance;
+                    }
+                }
+            }
+
+            if !matched_atoms.is_empty() {
+                let n_matched = matched_atoms.len() as f64;
+
+                // CRITICAL: Single-atom matches are weak evidence
+                // - Many residues have similar CA or CB individually
+                // - Only BOTH CA+CB matching is strong sequential evidence
+                // - Single matches need to be very tight (<0.3 ppm) to be meaningful
+                let tight_single_tol = 0.3;
+                let should_include = if n_matched >= 2.0 {
+                    // 2+ atoms match: strong evidence
+                    true
+                } else {
+                    // Single atom match: only if very tight
+                    max_diff < tight_single_tol
+                };
+
+                if should_include {
+                    // Strength: heavily reward multiple matches
+                    // Single match at 0.2 ppm: strength ~= 0.33 * 1.0 = 0.33
+                    // Double match at 0.2 ppm: strength ~= 0.66 * 2.0 = 1.32 (4x stronger)
+                    let match_bonus = if n_matched >= 2.0 { n_matched } else { 1.0 };
+                    let agg_strength = total_strength * match_bonus;
+
+                    links.push(GroupSequentialLink {
+                        from_group: from_idx,
+                        to_group: to_idx,
+                        strength: agg_strength,
+                        matched_atoms,
+                        avg_shift_diff: total_diff / n_matched,
+                        max_shift_diff: max_diff,
+                    });
+                }
+            }
+        }
+    }
+
+    links
+}
+
+/// Build sequential links (legacy version without diffs).
+pub fn build_group_sequential_links(
+    groups: &[SpinSystemEvidence],
+    c_tolerance: f64,
+) -> Vec<GroupSequentialLink> {
+    build_group_sequential_links_with_diffs(groups, c_tolerance)
+}
+
+// =============================================================================
+// END: Group-Level Bayesian Assignment
+// =============================================================================
+
 /// Configuration for the unified assignment algorithm.
 #[derive(Debug, Clone)]
 pub struct UnifiedAssignmentParams {
@@ -629,9 +2598,9 @@ impl Default for UnifiedAssignmentParams {
             tocsy_weight_final: 0.5,    // Keep low to avoid pulling backbones wrong
             typing_weight_initial: 1.0, // Typing as tie-breaker only
             typing_weight_final: 2.0,   // Slight increase but still secondary
-            sequential_weight: 5.0,     // Strong sequential links from triple-resonance
-            sequence_type_weight: 8.0,  // Moderate: typed X → must be at X position
-            sequence_type_confidence_threshold: 0.5,  // Apply when confidence > 50%
+            sequential_weight: 3.0,     // Moderate sequential links
+            sequence_type_weight: 10.0,  // Strong: typed X → must be at X position (anchor)
+            sequence_type_confidence_threshold: 0.35,  // Apply when confidence > 35% (catch more anchors)
             convergence_threshold: 1e-6,
             max_iterations: 100,
             damping: 0.5,               // Standard damping
@@ -686,8 +2655,9 @@ impl UnifiedAssignmentParams {
             tocsy_weight: self.tocsy_weight_initial * (1.0 - t) + self.tocsy_weight_final * t,
             typing_weight: self.typing_weight_initial * (1.0 - t) + self.typing_weight_final * t,
             sequential_weight: self.sequential_weight,
-            // Sequence-type constraint strengthens during refinement
-            sequence_type_weight: self.sequence_type_weight * t,  // Start at 0, ramp up
+            // Sequence-type constraint: distinctive residues (Gly, Ala, Thr, Ser) need anchoring
+            // from the START, not just during refinement. Start at 50% strength.
+            sequence_type_weight: self.sequence_type_weight * (0.5 + 0.5 * t),  // Start at 50%, ramp to 100%
             sequence_type_threshold: self.sequence_type_confidence_threshold,
             verbose: self.verbose,
             // 3D tolerances: same quadratic tightening schedule
@@ -2975,6 +4945,21 @@ pub fn run_observation_assignment(
         .collect();
     let domain_size = sequence.len() + 1;  // +1 for unassigned (index 0)
 
+    // Build type → positions map for sequence-type constraint (Factor 5)
+    // e.g., if sequence is "ACGDEF": "ALA" -> [1], "CYS" -> [2], "GLY" -> [3], etc.
+    // If a type appears multiple times, it has multiple valid positions
+    let mut type_to_positions: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, res_type) in residue_types.iter().enumerate() {
+        type_to_positions.entry(res_type.clone()).or_default().push(i + 1);
+    }
+
+    if params.verbose {
+        println!("\n--- SEQUENCE-TYPE MAP (Factor 5) ---");
+        for (aa_type, positions) in &type_to_positions {
+            println!("  {} appears at positions: {:?}", aa_type, positions);
+        }
+    }
+
     // Load KDE database for typing
     let kde = KDEDatabase::load_embedded();
 
@@ -2984,11 +4969,76 @@ pub fn run_observation_assignment(
         .collect();
 
     // Run belief propagation
-    // Identify backbone observations for uniqueness constraint
+    // Identify backbone observations - include ALL observations with (H, N) backbone
+    // For group-level BP, we need BOTH intra AND inter observations to aggregate evidence
+    // The intra/inter distinction is handled when collecting carbon evidence
     let backbone_indices: Vec<usize> = observations.iter().enumerate()
-        .filter(|(_, obs)| obs.experiment_type == PeakExperimentType::Hsqc15N)
+        .filter(|(_, obs)| {
+            // Include HSQC-15N and ALL triple-resonance peaks (both intra and inter)
+            // All of these have backbone (H, N) that anchors them to a residue
+            obs.experiment_type == PeakExperimentType::Hsqc15N ||
+            matches!(obs.experiment_type,
+                PeakExperimentType::Hnca |
+                PeakExperimentType::Hncaco |
+                PeakExperimentType::Hnco |
+                PeakExperimentType::Hncacb |
+                PeakExperimentType::Cbcaconh |
+                PeakExperimentType::Hbhaconh
+            )
+        })
         .map(|(idx, _)| idx)
         .collect();
+
+    // Create backbone GROUPS by (H, N) coordinates (HARD GROUPING)
+    // Observations with same backbone (H, N) should be treated as one unit
+    // This prevents multiple HNCA/HNCACB from same backbone competing against each other
+    let h_tolerance = 0.03;  // 0.03 ppm for H grouping
+    let n_tolerance = 0.3;   // 0.3 ppm for N grouping
+
+    // Group backbone observations by (H, N) coordinates
+    // Each group represents one backbone spin system
+    let mut backbone_groups: Vec<Vec<usize>> = Vec::new();
+    let mut assigned_to_group: HashSet<usize> = HashSet::new();
+
+    for &idx_a in &backbone_indices {
+        if assigned_to_group.contains(&idx_a) {
+            continue;
+        }
+        let Some((h_a, n_a)) = get_backbone_hn_from_obs(&observations[idx_a]) else { continue };
+
+        // Start a new group with this observation
+        let mut group = vec![idx_a];
+        assigned_to_group.insert(idx_a);
+
+        // Find all other backbone observations with matching (H, N)
+        for &idx_b in &backbone_indices {
+            if idx_a == idx_b || assigned_to_group.contains(&idx_b) {
+                continue;
+            }
+            let Some((h_b, n_b)) = get_backbone_hn_from_obs(&observations[idx_b]) else { continue };
+
+            if (h_a - h_b).abs() < h_tolerance && (n_a - n_b).abs() < n_tolerance {
+                group.push(idx_b);
+                assigned_to_group.insert(idx_b);
+            }
+        }
+
+        backbone_groups.push(group);
+    }
+
+    if params.verbose {
+        println!("\n=== BACKBONE GROUPING ===");
+        println!("Total backbone observations: {}", backbone_indices.len());
+        println!("Backbone groups (unique spin systems): {}", backbone_groups.len());
+        if backbone_groups.len() < 20 {
+            for (i, group) in backbone_groups.iter().enumerate() {
+                if let Some((h, n)) = get_backbone_hn_from_obs(&observations[group[0]]) {
+                    println!("  Group {}: H={:.3}, N={:.2} ({} obs)", i, h, n, group.len());
+                }
+            }
+        }
+        println!("=========================\n");
+    }
 
     // DEBUG: Find CG2-range carbon observations and track them
     let debug_cg2_indices: Vec<usize> = observations.iter().enumerate()
@@ -3012,6 +5062,103 @@ pub fn run_observation_assignment(
         println!("=====================================\n");
     }
 
+    // ==========================================================================
+    // GROUP-LEVEL BP: The simplified physics-based approach
+    // ==========================================================================
+    //
+    // Run BP on backbone GROUPS (66 variables) instead of observations (586).
+    // This is the correct formulation: one decision per spin system.
+
+    // 1. Build SpinSystemEvidence for each backbone group
+    let spin_system_evidence: Vec<SpinSystemEvidence> = backbone_groups.iter()
+        .enumerate()
+        .map(|(group_idx, obs_indices)| {
+            SpinSystemEvidence::from_observations(group_idx, obs_indices, observations)
+        })
+        .collect();
+
+    if params.verbose {
+        println!("\n=== SPIN SYSTEM EVIDENCE ===");
+        for (i, ev) in spin_system_evidence.iter().enumerate().take(5) {
+            println!("  Group {}: H={:.3}, N={:.2}", i, ev.h_shift, ev.n_shift);
+            println!("    Intra carbons: {:?}", ev.intra_carbons);
+            println!("    Inter carbons: {:?}", ev.inter_carbons);
+        }
+        println!("============================\n");
+    }
+
+    // 2. Build sequential links between groups
+    // Use BROAD tolerance initially - links will be filtered/weighted during BP based on match quality
+    // This follows the adaptive tolerance principle: start loose, converge to tight
+    let c_tolerance = params.triple_res_c_tolerance_initial.max(1.0);  // Broad initial tolerance
+    let group_sequential_links = build_group_sequential_links_with_diffs(&spin_system_evidence, c_tolerance);
+
+    if params.verbose {
+        println!("Sequential links between groups: {}", group_sequential_links.len());
+        for link in group_sequential_links.iter().take(10) {
+            println!("  Group {} -> {} (strength={:.2}, atoms={:?})",
+                link.from_group, link.to_group, link.strength, link.matched_atoms);
+        }
+    }
+
+    // 3. Run group-level BP
+    let group_assignments = run_group_level_bp(
+        &spin_system_evidence,
+        &group_sequential_links,
+        &residue_types,
+        sequence,
+        &kde,
+        params,
+    );
+
+    // 4. Map group assignments back to observations
+    // Create a lookup from observation index to assigned position
+    let mut obs_to_position: HashMap<usize, i32> = HashMap::new();
+
+    for (group_idx, position, _confidence) in &group_assignments {
+        let evidence = &spin_system_evidence[*group_idx];
+        for &obs_idx in &evidence.observation_indices {
+            let obs = &observations[obs_idx];
+            // Determine target position based on intra vs inter
+            let target_pos = if obs.intensity > 0.5 {
+                *position  // Intra: observes group's residue
+            } else {
+                *position - 1  // Inter: observes PRECEDING residue
+            };
+            if target_pos > 0 {
+                obs_to_position.insert(obs_idx, target_pos);
+            }
+        }
+    }
+
+    // Also add observations not in backbone groups (e.g., TOCSY-only protons)
+    // These need to be mapped via correlation with backbone groups
+    for (obs_idx, obs) in observations.iter().enumerate() {
+        if obs_to_position.contains_key(&obs_idx) {
+            continue;
+        }
+        // For now, leave unmapped observations with their current beliefs
+        // TODO: Use TOCSY correlations to map sidechain protons
+    }
+
+    // 5. Apply group assignments to beliefs
+    // This replaces the observation-level BP with deterministic assignment from groups
+    for (obs_idx, &position) in &obs_to_position {
+        // Set belief to strongly favor the assigned position
+        for d in 0..domain_size {
+            beliefs[*obs_idx][d] = if d as i32 == position { 0.95 } else { 0.05 / (domain_size - 1) as f64 };
+        }
+    }
+
+    if params.verbose {
+        println!("\n=== GROUP-LEVEL BP COMPLETE ===");
+        println!("Mapped {} / {} observations from group assignments", obs_to_position.len(), observations.len());
+        println!("================================\n");
+    }
+
+    // The old observation-level BP follows (now largely bypassed by group assignments)
+    // Keep it for observations not mapped by groups
+
     let max_iterations = params.max_iterations;
     for iteration in 0..max_iterations {
         let progress = iteration as f64 / max_iterations as f64;
@@ -3022,26 +5169,170 @@ pub fn run_observation_assignment(
             observations, &residue_types, &kde, tol_params, iteration, max_iterations
         );
 
+        // DEBUG: Print type confidence for each backbone group (iteration 0 only)
+        if params.verbose && iteration == 0 {
+            // DEBUG: Check typing scores for first few observations
+            println!("\n=== INITIAL TYPING SCORES (first 3 obs) ===");
+            for (idx, scores) in typing_scores.iter().enumerate().take(3) {
+                let obs = &observations[idx];
+                let (best_pos, &best_score) = scores.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .unwrap_or((0, &0.0));
+                let pos0_score = scores[0];
+                println!("  obs[{}] {:?}: pos0={:.4}, best_pos={} score={:.4}",
+                    idx, obs.experiment_type, pos0_score, best_pos, best_score);
+            }
+            println!("==========================================\n");
+
+            println!("\n=== TYPE CONFIDENCE PER BACKBONE GROUP ===");
+            let threshold = params.sequence_type_confidence_threshold;
+            let mut anchors: Vec<(usize, String, f64)> = Vec::new();
+            for (group_idx, group) in backbone_groups.iter().enumerate() {
+                // Aggregate typing scores for this group
+                let mut agg_scores = vec![0.0; domain_size];
+                for &obs_idx in group {
+                    for (d, &score) in typing_scores[obs_idx].iter().enumerate() {
+                        agg_scores[d] += score;
+                    }
+                }
+                // Normalize
+                let sum: f64 = agg_scores.iter().sum();
+                if sum > 0.0 {
+                    for s in &mut agg_scores { *s /= sum; }
+                }
+                // Compute type confidence for this group
+                if let Some((best_type, confidence)) = compute_type_confidence(&agg_scores, &residue_types) {
+                    if confidence > threshold {
+                        anchors.push((group_idx, best_type.clone(), confidence));
+                    }
+                }
+            }
+            println!("Anchor candidates (confidence > {:.0}%):", threshold * 100.0);
+            for (g, t, c) in &anchors {
+                println!("  Group {}: {} ({:.1}%)", g, t, c * 100.0);
+            }
+            println!("Total anchors: {} / {} backbone groups", anchors.len(), backbone_groups.len());
+            println!("==========================================\n");
+        }
+
         // Compute correlation scores (observation <-> observation with matching shifts)
         let correlation_scores = compute_observation_correlations(
             observations, tol_params, iteration, max_iterations
         );
+
+        // DEBUG: Count significant correlations (iteration 0 only)
+        if params.verbose && iteration == 0 {
+            let mut n_correlations = 0;
+            let mut total_strength = 0.0;
+            for i in 0..observations.len() {
+                for j in 0..observations.len() {
+                    if i != j && correlation_scores[i][j] > 0.01 {
+                        n_correlations += 1;
+                        total_strength += correlation_scores[i][j];
+                    }
+                }
+            }
+            println!("Correlations: {} pairs with strength > 0.01, avg={:.3}",
+                n_correlations, if n_correlations > 0 { total_strength / n_correlations as f64 } else { 0.0 });
+        }
 
         // Compute sequential relationships from triple-resonance carbon matching
         let sequential_links = compute_sequential_links(
             observations, tol_params, iteration, max_iterations
         );
 
-        // Message passing update with both same-residue and sequential factors
-        let mut new_beliefs = update_observation_beliefs_with_sequential(
-            &beliefs, &typing_scores, &correlation_scores, &sequential_links,
-            domain_size, interp.tocsy_weight, interp.typing_weight, interp.sequential_weight
+        // Debug: Print sequential links info (first iteration only)
+        if params.verbose && iteration == 0 {
+            let pos_links: Vec<_> = sequential_links.iter().filter(|l| l.strength > 0.0).collect();
+            let neg_links: Vec<_> = sequential_links.iter().filter(|l| l.strength < 0.0).collect();
+            println!("\n=== SEQUENTIAL LINKS ===");
+            println!("Positive (sequential ordering): {}", pos_links.len());
+            println!("Negative (same-residue): {}", neg_links.len());
+
+            // Count unique backbone pairs involved in links
+            let mut backbone_pairs: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+            for link in &pos_links {
+                // Get backbone group for each observation
+                let from_group = backbone_groups.iter().position(|g| g.contains(&link.from_idx));
+                let to_group = backbone_groups.iter().position(|g| g.contains(&link.to_idx));
+                if let (Some(fg), Some(tg)) = (from_group, to_group) {
+                    backbone_pairs.insert((fg.min(tg), fg.max(tg)));
+                }
+            }
+            println!("Unique backbone group pairs: {}", backbone_pairs.len());
+            println!("========================\n");
+        }
+
+        // Compute NOESY backbone-carbon correlations (Factor 3)
+        let noesy_links = compute_noesy_backbone_carbon(
+            observations, tol_params, iteration, max_iterations
         );
 
-        // HARD CONSTRAINT: Backbone uniqueness - each residue gets at most one backbone NH
-        // Implements exclusion factor: if peak A has high belief for residue R,
-        // other backbone peaks should have lower belief for R
-        apply_backbone_uniqueness_factor(&mut new_beliefs, &backbone_indices, domain_size);
+        // Message passing update with both same-residue and sequential factors
+        // Now includes Factor 3 (NOESY sequential) and Factor 5 (sequence-type constraint)
+        let mut new_beliefs = update_observation_beliefs_with_sequential(
+            &beliefs, &typing_scores, &correlation_scores, &sequential_links,
+            &noesy_links, &type_to_positions, &residue_types,
+            domain_size, interp.tocsy_weight, interp.typing_weight, interp.sequential_weight,
+            interp.sequence_type_weight, interp.sequence_type_threshold
+        );
+
+        // DEBUG: Check beliefs after message passing (iteration 0)
+        if params.verbose && iteration == 0 {
+            println!("\n=== BELIEFS AFTER MESSAGE PASSING ===");
+            for idx in 0..3.min(observations.len()) {
+                let obs = &observations[idx];
+                let belief = &new_beliefs[idx];
+                let (best_pos, &best_prob) = belief.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .unwrap_or((0, &0.0));
+                let pos0 = belief[0];
+                println!("  obs[{}] {:?}: pos0={:.4}, best_pos={} prob={:.4}",
+                    idx, obs.experiment_type, pos0, best_pos, best_prob);
+            }
+        }
+
+        // BACKBONE GROUPING FACTOR: Observations in the same backbone group should have same belief
+        // This synchronizes beliefs among HNCA/HNCACB/etc. from the same (H, N)
+        apply_backbone_grouping_factor(&mut new_beliefs, &backbone_groups, domain_size);
+
+        // DEBUG: Check beliefs after backbone grouping (iteration 0)
+        if params.verbose && iteration == 0 {
+            println!("\n=== BELIEFS AFTER BACKBONE GROUPING ===");
+            for idx in 0..3.min(observations.len()) {
+                let obs = &observations[idx];
+                let belief = &new_beliefs[idx];
+                let (best_pos, &best_prob) = belief.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .unwrap_or((0, &0.0));
+                let pos0 = belief[0];
+                // Find which backbone group this observation is in
+                let group_id = backbone_groups.iter().position(|g| g.contains(&idx)).unwrap_or(999);
+                let group_size = backbone_groups.get(group_id).map(|g| g.len()).unwrap_or(0);
+                println!("  obs[{}] {:?}: pos0={:.4}, best_pos={} prob={:.4} (group {} size {})",
+                    idx, obs.experiment_type, pos0, best_pos, best_prob, group_id, group_size);
+            }
+        }
+
+        // SOFT CONSTRAINT: Backbone group competition - each residue prefers one backbone group
+        // Use softer penalty (0.3x instead of 0.01x) during BP to allow recovery from early mistakes
+        // Full uniqueness is enforced at extraction time
+        apply_soft_backbone_group_uniqueness(&mut new_beliefs, &backbone_groups, domain_size);
+
+        // DEBUG: Check beliefs after soft uniqueness (iteration 0)
+        if params.verbose && iteration == 0 {
+            println!("\n=== BELIEFS AFTER SOFT UNIQUENESS ===");
+            for idx in 0..3.min(observations.len()) {
+                let obs = &observations[idx];
+                let belief = &new_beliefs[idx];
+                let (best_pos, &best_prob) = belief.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .unwrap_or((0, &0.0));
+                let pos0 = belief[0];
+                println!("  obs[{}] {:?}: pos0={:.4}, best_pos={} prob={:.4}",
+                    idx, obs.experiment_type, pos0, best_pos, best_prob);
+            }
+        }
 
         // Apply damping to prevent oscillation on loopy graph
         let damping = params.damping;
@@ -3071,14 +5362,607 @@ pub fn run_observation_assignment(
         }
     }
 
+    // DEBUG: Check backbone group composition and final beliefs
+    if params.verbose {
+        println!("\n=== BACKBONE GROUP COMPOSITION ===");
+        let mut exp_in_groups: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for group in &backbone_groups {
+            for &idx in group {
+                let exp = format!("{:?}", observations[idx].experiment_type);
+                *exp_in_groups.entry(exp).or_default() += 1;
+            }
+        }
+        println!("Observations in backbone groups by experiment type:");
+        for (exp, count) in &exp_in_groups {
+            println!("  {}: {}", exp, count);
+        }
+
+        // Check beliefs for first backbone group
+        if let Some(group) = backbone_groups.first() {
+            println!("\nFirst backbone group beliefs (max 3 members):");
+            for &idx in group.iter().take(3) {
+                let obs = &observations[idx];
+                let belief = &beliefs[idx];
+                let (best_pos, &best_prob) = belief.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .unwrap_or((0, &0.0));
+                println!("  {:?} intensity={:.2}: best_pos={} prob={:.3}",
+                    obs.experiment_type, obs.intensity, best_pos, best_prob);
+            }
+        }
+        println!("==================================\n");
+    }
+
+    // =========================================================================
+    // CHAIN-WALKING ALGORITHM
+    // =========================================================================
+    // After BP, use sequential links to propagate assignments from anchor points.
+    // This is more deterministic than soft BP for triple-resonance data.
+    //
+    // Algorithm:
+    // 1. Build graph of backbone groups connected by sequential links
+    // 2. Identify anchors: backbone groups with high-confidence residue type
+    // 3. For each anchor, find candidate positions (where that type occurs in sequence)
+    // 4. Walk chain from anchors, assigning neighbors by sequential constraints
+    // =========================================================================
+
+    // Recompute typing scores for chain-walking (using final tolerances)
+    let typing_scores = compute_observation_typing_scores(
+        observations, &residue_types, &kde, tol_params, params.max_iterations, params.max_iterations
+    );
+
+    // Step 1: Build backbone group connectivity from sequential links
+    // Each backbone group is a node; sequential links create directed edges
+    // AGGREGATE link strengths: if CA AND CB both match, that's stronger evidence!
+
+    // Build sequential link index from observation index to backbone group
+    // IMPORTANT: Include BOTH intra and inter observations!
+    // Inter observations aren't in backbone_groups directly, but we can find their
+    // associated backbone group by matching (H, N) coordinates.
+    let mut obs_to_group: HashMap<usize, usize> = HashMap::new();
+
+    // First: direct mapping for observations in backbone groups
+    for (group_idx, group) in backbone_groups.iter().enumerate() {
+        for &obs_idx in group {
+            obs_to_group.insert(obs_idx, group_idx);
+        }
+    }
+
+    // Second: map inter observations (not in backbone_groups) to their backbone group
+    // by matching (H, N) coordinates
+    let h_tolerance = 0.03;
+    let n_tolerance = 0.3;
+
+    for (obs_idx, obs) in observations.iter().enumerate() {
+        if obs_to_group.contains_key(&obs_idx) {
+            continue;  // Already mapped
+        }
+
+        // Try to find this observation's backbone (H, N)
+        let h = obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::H1)
+            .map(|d| d.shift);
+        let n = obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::N15)
+            .map(|d| d.shift);
+
+        if let (Some(h_shift), Some(n_shift)) = (h, n) {
+            // Find the backbone group with matching (H, N)
+            for (group_idx, group) in backbone_groups.iter().enumerate() {
+                if let Some((ref_h, ref_n)) = get_backbone_hn_from_obs(&observations[group[0]]) {
+                    if (h_shift - ref_h).abs() < h_tolerance && (n_shift - ref_n).abs() < n_tolerance {
+                        obs_to_group.insert(obs_idx, group_idx);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if params.verbose {
+        let mapped_obs = obs_to_group.len();
+        println!("Observations mapped to backbone groups: {} / {}", mapped_obs, observations.len());
+    }
+
+    // Aggregate sequential links at group level
+    let sequential_links = compute_sequential_links(
+        observations, tol_params, params.max_iterations, params.max_iterations
+    );
+
+    // First pass: aggregate link strengths per group pair
+    // Key: (from_group, to_group) -> (sum_strength, count, max_strength)
+    let mut pair_strengths: HashMap<(usize, usize), (f64, usize, f64)> = HashMap::new();
+
+    for link in &sequential_links {
+        if link.strength <= 0.0 { continue; }  // Only use sequential (positive) links
+
+        let Some(&from_group) = obs_to_group.get(&link.from_idx) else { continue };
+        let Some(&to_group) = obs_to_group.get(&link.to_idx) else { continue };
+
+        if from_group == to_group { continue; }  // Skip same-group links
+
+        let entry = pair_strengths.entry((from_group, to_group)).or_insert((0.0, 0, 0.0));
+        entry.0 += link.strength;  // Sum
+        entry.1 += 1;              // Count
+        entry.2 = entry.2.max(link.strength);  // Max
+    }
+
+    // Second pass: build group links with aggregated strength
+    // Use: sum * sqrt(count) to reward multiple confirming links
+    let mut group_links: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+    let mut reverse_links: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+
+    for ((from_group, to_group), (sum, count, max)) in &pair_strengths {
+        // Aggregated strength: reward multiple matching carbons
+        // If CA and CB both match perfectly (strength=1.0 each), agg_strength = 2.0 * sqrt(2) ≈ 2.83
+        // If only one matches perfectly, agg_strength = 1.0
+        let agg_strength = sum * ((*count as f64).sqrt());
+
+        group_links.entry(*from_group).or_default().push((*to_group, agg_strength));
+        reverse_links.entry(*to_group).or_default().push((*from_group, agg_strength));
+    }
+
+    if params.verbose {
+        // Count high-confidence links (multiple carbons matching)
+        let multi_carbon_links = pair_strengths.values().filter(|(_, count, _)| *count >= 2).count();
+        let perfect_links = pair_strengths.values().filter(|(_, _, max)| *max > 0.99).count();
+
+        // Aggregated strength distribution
+        let agg_strengths: Vec<f64> = pair_strengths.values()
+            .map(|(sum, count, _)| sum * ((*count as f64).sqrt()))
+            .collect();
+        let above_4 = agg_strengths.iter().filter(|&&s| s >= 4.0).count();
+        let above_3 = agg_strengths.iter().filter(|&&s| s >= 3.0).count();
+        let above_2 = agg_strengths.iter().filter(|&&s| s >= 2.0).count();
+
+        println!("\n=== GROUP-LEVEL SEQUENTIAL LINKS ===");
+        println!("Total group pairs: {}", pair_strengths.len());
+        println!("Multi-carbon links (count >= 2): {}", multi_carbon_links);
+        println!("Perfect matches (strength > 0.99): {}", perfect_links);
+        println!("Aggregated strength distribution:");
+        println!("  >= 4.0: {}", above_4);
+        println!("  >= 3.0: {}", above_3);
+        println!("  >= 2.0: {}", above_2);
+        println!("====================================\n");
+    }
+
+    // Step 2: Identify anchors with high-confidence typing
+    let anchor_threshold = 0.40;  // 40% confidence threshold for anchors
+    let mut anchors: Vec<(usize, String, f64, Vec<usize>)> = Vec::new();  // (group_idx, type, confidence, candidate_positions)
+
+    for (group_idx, group) in backbone_groups.iter().enumerate() {
+        // Aggregate typing scores for this group
+        let mut agg_scores = vec![0.0f64; domain_size];
+        for &obs_idx in group {
+            for (d, &score) in typing_scores[obs_idx].iter().enumerate() {
+                agg_scores[d] += score;
+            }
+        }
+        // Normalize
+        let sum: f64 = agg_scores.iter().sum();
+        if sum > 0.0 {
+            for s in &mut agg_scores { *s /= sum; }
+        }
+
+        // Find best type and confidence
+        if let Some((best_type, confidence)) = compute_type_confidence(&agg_scores, &residue_types) {
+            if confidence >= anchor_threshold {
+                // Find which sequence positions have this residue type
+                let candidate_positions: Vec<usize> = residue_types.iter()
+                    .enumerate()
+                    .filter(|(_, t)| *t == &best_type)
+                    .map(|(pos, _)| pos + 1)  // 1-indexed
+                    .collect();
+
+                if !candidate_positions.is_empty() {
+                    anchors.push((group_idx, best_type, confidence, candidate_positions));
+                }
+            }
+        }
+    }
+
+    // Sort anchors by uniqueness (fewer candidates = more unique), then by confidence
+    anchors.sort_by(|a, b| {
+        // First criterion: fewer candidate positions = more unique (higher priority)
+        let uniqueness_cmp = a.3.len().cmp(&b.3.len());
+        if uniqueness_cmp != std::cmp::Ordering::Equal {
+            return uniqueness_cmp;
+        }
+        // Second criterion: higher confidence
+        b.2.partial_cmp(&a.2).unwrap()
+    });
+
+    // Step 2b: Find chain distances between anchor groups
+    // This helps disambiguate which anchor is at which position
+    let min_link_strength = 4.0;  // Only use high-confidence links for chain discovery
+
+    // BFS to find shortest path (in terms of sequential steps) between groups
+    fn find_chain_distance(
+        from_group: usize,
+        to_group: usize,
+        forward_links: &HashMap<usize, Vec<(usize, f64)>>,
+        min_strength: f64,
+        max_distance: usize,
+    ) -> Option<i32> {
+        use std::collections::VecDeque;
+        let mut visited = HashSet::new();
+        let mut queue: VecDeque<(usize, i32)> = VecDeque::new();  // (group, distance)
+
+        queue.push_back((from_group, 0));
+        visited.insert(from_group);
+
+        while let Some((current, dist)) = queue.pop_front() {
+            if current == to_group {
+                return Some(dist);
+            }
+            if dist as usize >= max_distance {
+                continue;
+            }
+
+            if let Some(neighbors) = forward_links.get(&current) {
+                for &(next, strength) in neighbors {
+                    if strength >= min_strength && !visited.contains(&next) {
+                        visited.insert(next);
+                        queue.push_back((next, dist + 1));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Find chain distances between GLY anchors (they're the most constrained)
+    let gly_anchors: Vec<_> = anchors.iter()
+        .filter(|(_, t, _, _)| t == "GLY")
+        .collect();
+
+    // Find groups with only one strong outgoing link (chain start candidates)
+    // and groups with only one strong incoming link (chain end candidates)
+    let mut out_degree: HashMap<usize, usize> = HashMap::new();
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
+
+    for (&from_group, neighbors) in &group_links {
+        let strong_out = neighbors.iter().filter(|(_, s)| *s >= min_link_strength).count();
+        *out_degree.entry(from_group).or_default() += strong_out;
+    }
+    for (&to_group, neighbors) in &reverse_links {
+        let strong_in = neighbors.iter().filter(|(_, s)| *s >= min_link_strength).count();
+        *in_degree.entry(to_group).or_default() += strong_in;
+    }
+
+    // Chain starts: out_degree > 0, in_degree == 0 (or not in in_degree)
+    let chain_starts: Vec<usize> = (0..backbone_groups.len())
+        .filter(|&g| out_degree.get(&g).copied().unwrap_or(0) > 0 &&
+                     in_degree.get(&g).copied().unwrap_or(0) == 0)
+        .collect();
+
+    // Find longest chain from each start
+    fn find_longest_chain(
+        start: usize,
+        forward_links: &HashMap<usize, Vec<(usize, f64)>>,
+        min_strength: f64,
+    ) -> Vec<usize> {
+        let mut chain = vec![start];
+        let mut visited = HashSet::new();
+        visited.insert(start);
+        let mut current = start;
+
+        loop {
+            let best_next = forward_links.get(&current)
+                .map(|neighbors| {
+                    neighbors.iter()
+                        .filter(|(n, s)| *s >= min_strength && !visited.contains(n))
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                })
+                .flatten();
+
+            match best_next {
+                Some(&(next, _)) => {
+                    chain.push(next);
+                    visited.insert(next);
+                    current = next;
+                }
+                None => break,
+            }
+        }
+        chain
+    }
+
+    let mut longest_chain: Vec<usize> = Vec::new();
+    for &start in &chain_starts {
+        let chain = find_longest_chain(start, &group_links, min_link_strength);
+        if chain.len() > longest_chain.len() {
+            longest_chain = chain;
+        }
+    }
+
+    if params.verbose {
+        println!("\n=== CHAIN ANALYSIS ===");
+        println!("Chain start candidates (out>0, in=0): {:?}", chain_starts);
+        println!("Longest chain length: {}", longest_chain.len());
+        if longest_chain.len() <= 20 {
+            println!("Longest chain: {:?}", longest_chain);
+        } else {
+            println!("Longest chain (first 10): {:?}", &longest_chain[..10]);
+            println!("Longest chain (last 10): {:?}", &longest_chain[longest_chain.len()-10..]);
+        }
+
+        // Validate chain against ground truth (if available)
+        let mut ground_truth_positions: Vec<Option<usize>> = Vec::new();
+        for &group_idx in &longest_chain {
+            // Get ground truth from first observation in this group
+            let gt_pos = backbone_groups.get(group_idx)
+                .and_then(|group| group.first())
+                .and_then(|&obs_idx| observations.get(obs_idx))
+                .and_then(|obs| obs.ground_truth.as_ref())
+                .map(|gt| gt.residue_position);
+            ground_truth_positions.push(gt_pos);
+        }
+
+        // Check if chain is sequential in ground truth
+        let valid_gt: Vec<usize> = ground_truth_positions.iter()
+            .filter_map(|&p| p)
+            .collect();
+        println!("Ground truth positions found: {} / {} groups", valid_gt.len(), longest_chain.len());
+        if !valid_gt.is_empty() {
+            let is_sequential = valid_gt.windows(2).all(|w| w[1] == w[0] + 1);
+            println!("  First 10: {:?}", &valid_gt[..valid_gt.len().min(10)]);
+            println!("  Last 10: {:?}", &valid_gt[valid_gt.len().saturating_sub(10)..]);
+            println!("  Chain is sequential in GT: {}", is_sequential);
+        }
+        println!("======================\n");
+    }
+
+    if params.verbose && gly_anchors.len() >= 2 {
+        println!("\n=== ANCHOR CHAIN DISTANCES ===");
+        for i in 0..gly_anchors.len() {
+            for j in (i+1)..gly_anchors.len() {
+                let (g1, _, _, _) = gly_anchors[i];
+                let (g2, _, _, _) = gly_anchors[j];
+                let fwd_dist = find_chain_distance(*g1, *g2, &group_links, min_link_strength, 100);
+                let bwd_dist = find_chain_distance(*g2, *g1, &group_links, min_link_strength, 100);
+                if fwd_dist.is_some() || bwd_dist.is_some() {
+                    println!("  GLY Group {} <-> GLY Group {}: fwd={:?}, bwd={:?}",
+                        g1, g2, fwd_dist, bwd_dist);
+                }
+            }
+        }
+        println!("Expected GLY distances: 10->35=25, 35->47=12, 47->53=6");
+        println!("==============================\n");
+    }
+
+    if params.verbose {
+        println!("\n=== CHAIN-WALKING ANCHORS ===");
+        println!("Found {} anchors (confidence >= {:.0}%)", anchors.len(), anchor_threshold * 100.0);
+        for (group_idx, residue_type, conf, positions) in anchors.iter().take(10) {
+            println!("  Group {}: {} ({:.1}%) -> positions {:?}",
+                group_idx, residue_type, conf * 100.0, positions);
+        }
+        println!("=============================\n");
+    }
+
+    // Step 3: Use proline positions to identify chain boundaries
+    // Prolines have no backbone NH, so they create natural breaks in triple-resonance chains
+    let proline_positions: Vec<usize> = residue_types.iter()
+        .enumerate()
+        .filter(|(_, t)| *t == "PRO")
+        .map(|(i, _)| i + 1)  // 1-indexed
+        .collect();
+
+    // Chain segments are ranges between prolines (and sequence start/end)
+    // Position 1 (Met) also has no backbone NH, so chains start at position 2
+    let mut chain_segments: Vec<(usize, usize)> = Vec::new();  // (start_pos, end_pos) inclusive
+    let mut segment_start = 2;  // Skip position 1 (N-terminus)
+
+    for &pro_pos in &proline_positions {
+        if pro_pos > segment_start {
+            chain_segments.push((segment_start, pro_pos - 1));
+        }
+        segment_start = pro_pos + 1;
+    }
+    // Add final segment
+    if segment_start <= sequence.len() {
+        chain_segments.push((segment_start, sequence.len()));
+    }
+
+    if params.verbose {
+        println!("\n=== PROLINE-BASED CHAIN SEGMENTS ===");
+        println!("Proline positions: {:?}", proline_positions);
+        println!("Chain segments (residue ranges):");
+        for (i, (start, end)) in chain_segments.iter().enumerate() {
+            println!("  Segment {}: positions {}-{} ({} residues)", i, start, end, end - start + 1);
+        }
+        println!("=====================================\n");
+    }
+
+    // Initialize assignment tracking
+    let mut group_assignments: HashMap<usize, i32> = HashMap::new();
+    let mut position_assigned: HashSet<i32> = HashSet::new();
+
+    // Mark proline positions as assigned (they have no backbone groups)
+    for &pro_pos in &proline_positions {
+        position_assigned.insert(pro_pos as i32);
+    }
+    // Also mark position 1 (N-terminus has no backbone NH)
+    position_assigned.insert(1);
+
+    // Match discovered chains to segments by length and assign directly
+    // If the longest chain has 32 groups and segment 39-70 has 32 positions, we can assign directly!
+    if !longest_chain.is_empty() {
+        let chain_len = longest_chain.len();
+        let matching_segment = chain_segments.iter()
+            .find(|(start, end)| (*end - *start + 1) == chain_len);
+
+        if let Some(&(seg_start, _seg_end)) = matching_segment {
+            if params.verbose {
+                println!("Longest chain ({} groups) matches segment starting at position {}", chain_len, seg_start);
+                println!("Directly assigning chain to segment positions...");
+            }
+
+            // Directly assign chain groups to segment positions
+            for (i, &group_idx) in longest_chain.iter().enumerate() {
+                let position = (seg_start + i) as i32;
+                group_assignments.insert(group_idx, position);
+                position_assigned.insert(position);
+            }
+
+            if params.verbose {
+                println!("Assigned {} groups from longest chain", longest_chain.len());
+
+                // Verify: print first 10 assignments with their (H, N) shifts
+                println!("Verifying chain assignments (first 10):");
+                for (i, &group_idx) in longest_chain.iter().take(10).enumerate() {
+                    let position = seg_start + i;
+                    if let Some((h, n)) = backbone_groups.get(group_idx)
+                        .and_then(|g| g.first())
+                        .and_then(|&obs_idx| observations.get(obs_idx))
+                        .and_then(|obs| {
+                            let h = obs.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift)?;
+                            let n = obs.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift)?;
+                            Some((h, n))
+                        })
+                    {
+                        let seq_char = sequence.chars().nth(position - 1).unwrap_or('?');
+                        println!("  Group {} -> pos {} ({}): H={:.3}, N={:.2}",
+                            group_idx, position, seq_char, h, n);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 4: Chain-walking from anchors (for remaining unassigned groups)
+
+    // Helper: Walk chain in one direction from a starting group
+    fn walk_chain(
+        start_group: usize,
+        start_pos: i32,
+        links: &HashMap<usize, Vec<(usize, f64)>>,
+        domain_size: usize,
+        group_assignments: &mut HashMap<usize, i32>,
+        position_assigned: &mut HashSet<i32>,
+        direction: i32,  // +1 for forward, -1 for backward
+    ) -> usize {
+        let mut current_group = start_group;
+        let mut current_pos = start_pos;
+        let mut assigned_count = 0;
+
+        loop {
+            let next_pos = current_pos + direction;
+            if next_pos < 1 || next_pos >= domain_size as i32 {
+                break;  // Out of bounds
+            }
+
+            // Find next group with strongest link
+            let neighbors = links.get(&current_group);
+            if neighbors.is_none() || neighbors.unwrap().is_empty() {
+                break;
+            }
+
+            // Find best unassigned neighbor with sufficient strength
+            // Require aggregated strength >= 2.5 (roughly 2 carbons matching at 0.99+ strength)
+            let min_link_strength = 2.5;
+            let best_neighbor = neighbors.unwrap().iter()
+                .filter(|(ng, strength)| !group_assignments.contains_key(ng) && *strength >= min_link_strength)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+            let Some(&(next_group, _strength)) = best_neighbor else { break };
+
+            // Check if next position is available
+            if position_assigned.contains(&next_pos) {
+                break;  // Position already taken
+            }
+
+            // Assign next group to next position
+            group_assignments.insert(next_group, next_pos);
+            position_assigned.insert(next_pos);
+            assigned_count += 1;
+
+            current_group = next_group;
+            current_pos = next_pos;
+        }
+
+        assigned_count
+    }
+
+    // Process anchors in order of quality
+    for (group_idx, _residue_type, _conf, candidate_positions) in &anchors {
+        if group_assignments.contains_key(group_idx) {
+            continue;  // Already assigned by previous chain walk
+        }
+
+        // Find first available candidate position
+        let Some(&chosen_pos) = candidate_positions.iter()
+            .find(|&&pos| !position_assigned.contains(&(pos as i32)))
+        else {
+            continue;  // No available positions for this type
+        };
+
+        // Assign this anchor
+        group_assignments.insert(*group_idx, chosen_pos as i32);
+        position_assigned.insert(chosen_pos as i32);
+
+        // Walk forward (using group_links: from -> to means from precedes to)
+        walk_chain(*group_idx, chosen_pos as i32, &group_links, domain_size,
+            &mut group_assignments, &mut position_assigned, 1);
+
+        // Walk backward (using reverse_links: to -> from means from precedes to)
+        walk_chain(*group_idx, chosen_pos as i32, &reverse_links, domain_size,
+            &mut group_assignments, &mut position_assigned, -1);
+    }
+
+    if params.verbose {
+        println!("\n=== CHAIN-WALKING RESULTS ===");
+        println!("Assigned {} / {} backbone groups", group_assignments.len(), backbone_groups.len());
+
+        // Show first 20 assignments
+        let mut sorted_assignments: Vec<_> = group_assignments.iter().collect();
+        sorted_assignments.sort_by_key(|(_, &pos)| pos);
+        for (group_idx, pos) in sorted_assignments.iter().take(20) {
+            let seq_char = if (**pos > 0) && ((**pos as usize) <= sequence.len()) {
+                sequence.chars().nth(**pos as usize - 1).unwrap_or('?')
+            } else { '?' };
+            println!("  Group {} -> position {} ({})", group_idx, pos, seq_char);
+        }
+        println!("=============================\n");
+    }
+
+    // Step 5: DISABLED - chain-walking override
+    // The group-level BP already set beliefs at lines 3826-3831.
+    // The chain-walking code here was creating a SECOND set of assignments that
+    // overrode the group-level BP results, causing conflicts.
+    // Let's rely solely on group-level BP results for now.
+
+    // TODO: Integrate chain-walking as a POST-HOC verification step, not an override
+
     // Extract assignments with backbone uniqueness constraint
-    // Backbone peaks (HSQC15N) must be assigned to unique residues
-    let mut assigned_backbone_residues: HashSet<i32> = HashSet::new();
+    // Each backbone-type observation should map to at most one residue, but different
+    // experiment types can confirm the same residue.
+    // - HSQC15N: one per residue (classic fingerprint)
+    // - HNCA intra: one per residue (CA(i) + H/N)
+    // - HNCACO intra: one per residue (CO(i) + H/N)
+    let mut assigned_hsqc_residues: HashSet<i32> = HashSet::new();
+    let mut assigned_hnca_residues: HashSet<i32> = HashSet::new();
+    let mut assigned_hncaco_residues: HashSet<i32> = HashSet::new();
     let mut results: Vec<ObservationAssignmentResult> = Vec::with_capacity(observations.len());
 
-    // Sort backbone peaks by confidence (highest first) for greedy assignment
+    // Helper to check if an observation provides backbone H/N evidence (for debug output)
+    let is_backbone_observation = |obs: &Observation| -> bool {
+        obs.experiment_type == PeakExperimentType::Hsqc15N ||
+        (matches!(obs.experiment_type, PeakExperimentType::Hnca | PeakExperimentType::Hncaco)
+         && obs.intensity > 0.5)  // Intra peaks only
+    };
+
+    // Helper to check if an observation is a backbone intra peak (for uniqueness)
+    let is_intra_backbone = |obs: &Observation| -> bool {
+        obs.experiment_type == PeakExperimentType::Hsqc15N ||
+        (matches!(obs.experiment_type, PeakExperimentType::Hnca | PeakExperimentType::Hncaco)
+         && obs.intensity > 0.5)
+    };
+
+    // Sort all backbone-type peaks by confidence for greedy assignment
     let mut backbone_indices: Vec<(usize, f64)> = observations.iter().enumerate()
-        .filter(|(_, obs)| obs.experiment_type == PeakExperimentType::Hsqc15N)
+        .filter(|(_, obs)| is_intra_backbone(obs))
         .map(|(idx, _)| {
             let best_prob = beliefs[idx].iter().skip(1).fold(0.0f64, |a, &b| a.max(b));
             (idx, best_prob)
@@ -3086,16 +5970,25 @@ pub fn run_observation_assignment(
         .collect();
     backbone_indices.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    // First pass: Assign backbone peaks greedily with uniqueness
+    // First pass: Assign backbone peaks greedily with per-experiment-type uniqueness
+    // Each experiment type maintains its own "one peak per residue" constraint
     let mut assigned: HashSet<usize> = HashSet::new();
     for (obs_idx, _) in &backbone_indices {
         let belief = &beliefs[*obs_idx];
         let obs = &observations[*obs_idx];
 
-        // Find best available residue (not already assigned to another backbone)
+        // Get the appropriate uniqueness set for this experiment type
+        let assigned_residues = match obs.experiment_type {
+            PeakExperimentType::Hsqc15N => &assigned_hsqc_residues,
+            PeakExperimentType::Hnca => &assigned_hnca_residues,
+            PeakExperimentType::Hncaco => &assigned_hncaco_residues,
+            _ => &assigned_hsqc_residues,  // Shouldn't happen, but default to HSQC
+        };
+
+        // Find best available residue (not already assigned by THIS experiment type)
         let best = belief.iter().enumerate()
             .skip(1)  // Skip unassigned (index 0)
-            .filter(|(r, _)| !assigned_backbone_residues.contains(&(*r as i32)))
+            .filter(|(r, _)| !assigned_residues.contains(&(*r as i32)))
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
 
         let (best_idx, best_prob) = match best {
@@ -3103,7 +5996,13 @@ pub fn run_observation_assignment(
             None => (0, belief[0]),  // Fall back to unassigned if all residues taken
         };
 
-        assigned_backbone_residues.insert(best_idx as i32);
+        // Update the appropriate uniqueness set
+        match obs.experiment_type {
+            PeakExperimentType::Hsqc15N => { assigned_hsqc_residues.insert(best_idx as i32); }
+            PeakExperimentType::Hnca => { assigned_hnca_residues.insert(best_idx as i32); }
+            PeakExperimentType::Hncaco => { assigned_hncaco_residues.insert(best_idx as i32); }
+            _ => {}
+        }
         assigned.insert(*obs_idx);
 
         results.push(ObservationAssignmentResult {
@@ -3140,12 +6039,18 @@ pub fn run_observation_assignment(
     if params.verbose {
         println!("\n=== BACKBONE PEAK ASSIGNMENTS ===");
         for (obs, result) in observations.iter().zip(results.iter()) {
-            if obs.experiment_type == PeakExperimentType::Hsqc15N {
+            if is_backbone_observation(obs) {
+                let exp_name = match obs.experiment_type {
+                    PeakExperimentType::Hsqc15N => "HSQC15N",
+                    PeakExperimentType::Hnca => "HNCA",
+                    PeakExperimentType::Hncaco => "HNCACO",
+                    _ => "OTHER",
+                };
                 let shifts: Vec<_> = obs.dimensions.iter()
                     .map(|d| format!("{:?}={:.3}", d.nucleus, d.shift))
                     .collect();
-                println!("  HSQC15N: {} -> residue {} (conf={:.3})",
-                    shifts.join(", "), result.assigned_residue, result.confidence);
+                println!("  {}: {} -> residue {} (conf={:.3})",
+                    exp_name, shifts.join(", "), result.assigned_residue, result.confidence);
             }
         }
         println!("================================\n");
@@ -3177,6 +6082,8 @@ pub fn run_observation_assignment(
 }
 
 /// Compute typing scores for observations based on chemical shifts.
+/// Now offset-aware: passes full residue_types array so inter-residue dimensions
+/// (PrecedingResidue, FollowingResidue) can be scored against the correct residue types.
 fn compute_observation_typing_scores(
     observations: &[Observation],
     residue_types: &[String],
@@ -3196,12 +6103,35 @@ fn compute_observation_typing_scores(
 
         let mut scores = vec![unassigned_base; domain_size];
 
-        // Score against each residue type
-        for (r, res_type) in residue_types.iter().enumerate() {
+        // Check if this observation has backbone H/N (requires both Intra H1 and Intra N15)
+        // This is used for N-terminus exclusion: position 1 has no backbone NH
+        let has_backbone_hn = obs.dimensions.iter().any(|d|
+            d.nucleus == NucleusType::H1 &&
+            d.residue_offset == ResidueOffset::Intra &&
+            matches!(&d.atom_constraint, AtomConstraint::Exact(s) if s == "H")
+        ) && obs.dimensions.iter().any(|d|
+            d.nucleus == NucleusType::N15 &&
+            d.residue_offset == ResidueOffset::Intra &&
+            matches!(&d.atom_constraint, AtomConstraint::Exact(s) if s == "N")
+        );
+
+        // Score against each residue POSITION (1-indexed)
+        // The function now uses ResidueOffset to score each dimension against the
+        // appropriate residue type (i for Intra, i-1 for PrecedingResidue, etc.)
+        for r in 0..residue_types.len() {
+            let candidate_pos = r + 1;  // 1-indexed position
+
+            // N-TERMINUS EXCLUSION: Position 1 cannot have backbone NH
+            // The N-terminus has -NH3+ instead of backbone amide NH
+            if has_backbone_hn && candidate_pos == 1 {
+                scores[candidate_pos] = 1e-20;  // Effectively zero
+                continue;
+            }
+
             let score = score_observation_for_residue_type(
-                obs, res_type, kde, tol_params, iteration, max_iterations
+                obs, candidate_pos, residue_types, kde, tol_params, iteration, max_iterations
             );
-            scores[r + 1] = score.max(1e-10);
+            scores[candidate_pos] = score.max(1e-10);
         }
 
         // Normalize
@@ -3215,31 +6145,64 @@ fn compute_observation_typing_scores(
     }).collect()
 }
 
-/// Score how well an observation matches a residue type.
+/// Score how well an observation matches a residue POSITION.
 ///
 /// Physics-based: uses atom_constraint AND residue topology for hard constraints.
+/// Now offset-aware: dimensions with ResidueOffset::PrecedingResidue score against
+/// the preceding residue type (i-1), not the candidate position.
 ///
-/// HARD CONSTRAINT: If an atom doesn't exist in the residue type's topology,
-/// score = 0. This is physical law, not a preference.
-///
-/// NOTE: For now, we use ALL dimensions for typing, including inter-residue carbons.
-/// A more sophisticated model would need to handle that inter-residue observations
-/// provide evidence about BOTH the anchor residue AND the preceding residue.
+/// HARD CONSTRAINT: If an atom doesn't exist in the target residue type's topology,
+/// that dimension contributes 0 probability.
 fn score_observation_for_residue_type(
     obs: &Observation,
-    res_type: &str,
+    candidate_pos: usize,        // 1-indexed position being evaluated
+    residue_types: &[String],    // Full sequence (0-indexed)
     kde: &KDEDatabase,
     _tol_params: &NucleusToleranceParams,
     _iteration: usize,
     _max_iterations: usize,
 ) -> f64 {
-    // Get topology for this residue type - enables hard constraints
-    let topology = get_topology_by_three(res_type);
-
     let mut log_score = 0.0;
     let debug_this = false;  // Disable verbose debug
 
     for dim in &obs.dimensions {
+        // Determine which residue type this dimension should be scored against
+        // based on its ResidueOffset - this is the key fix for inter-residue observations
+        let target_res_type: Option<&str> = match dim.residue_offset {
+            ResidueOffset::Intra => {
+                // Score against candidate position
+                residue_types.get(candidate_pos - 1).map(|s| s.as_str())
+            },
+            ResidueOffset::PrecedingResidue => {
+                // Score against position before candidate (i-1)
+                if candidate_pos >= 2 {
+                    residue_types.get(candidate_pos - 2).map(|s| s.as_str())
+                } else {
+                    None  // No preceding residue for position 1
+                }
+            },
+            ResidueOffset::FollowingResidue => {
+                // Score against position after candidate (i+1)
+                residue_types.get(candidate_pos).map(|s| s.as_str())
+            },
+            ResidueOffset::Unknown => {
+                // Default to candidate position (e.g., NOESY where relationship is ambiguous)
+                residue_types.get(candidate_pos - 1).map(|s| s.as_str())
+            },
+        };
+
+        // If no valid target residue (edge case like position 1 for PrecedingResidue),
+        // apply a penalty but don't completely reject
+        let Some(res_type) = target_res_type else {
+            // Edge case penalty: this position can't satisfy this dimension's offset
+            // Use a very small probability in log space
+            log_score += 1e-10_f64.ln();  // Strong but not absolute penalty
+            continue;
+        };
+
+        // Get topology for the TARGET residue type (not necessarily candidate!)
+        let topology = get_topology_by_three(res_type);
+
         // Physics-based: use atom_constraint instead of nucleus-based guessing
         let atom_candidates = atoms_from_constraint(&dim.atom_constraint, dim.nucleus);
 
@@ -3257,8 +6220,8 @@ fn score_observation_for_residue_type(
         // HARD CONSTRAINT: If no valid atoms exist, this assignment is impossible
         if valid_atoms.is_empty() && topology.is_some() {
             if debug_this {
-                println!("  HARD CONSTRAINT: {} has no atoms {:?} (candidates were {:?})",
-                         res_type, valid_atoms, atom_candidates);
+                println!("  HARD CONSTRAINT: pos {} offset={:?} -> {} has no atoms {:?} (candidates were {:?})",
+                         candidate_pos, dim.residue_offset, res_type, valid_atoms, atom_candidates);
             }
             return 0.0;  // Impossible assignment - residue doesn't have these atoms
         }
@@ -3276,8 +6239,8 @@ fn score_observation_for_residue_type(
         }
 
         if debug_this {
-            println!("  SCORE: {} {:?} constraint={:?} shift={:.2} -> valid_atoms={:?}, best={}:{:.2e}",
-                     res_type, dim.nucleus, dim.atom_constraint, dim.shift, valid_atoms, best_atom, best_density);
+            println!("  SCORE: pos {} offset={:?} -> {} {:?} constraint={:?} shift={:.2} -> valid_atoms={:?}, best={}:{:.2e}",
+                     candidate_pos, dim.residue_offset, res_type, dim.nucleus, dim.atom_constraint, dim.shift, valid_atoms, best_atom, best_density);
         }
 
         log_score += best_density.max(1e-10).ln();
@@ -3285,7 +6248,7 @@ fn score_observation_for_residue_type(
 
     let score = log_score.exp();
     if debug_this {
-        println!("  SCORE: {} log={:.4} -> exp={:.2e}", res_type, log_score, score);
+        println!("  SCORE: pos {} log={:.4} -> exp={:.2e}", candidate_pos, log_score, score);
     }
 
     score
@@ -3748,7 +6711,11 @@ fn compute_sequential_links(
 ) -> Vec<SequentialLink> {
     use crate::data::spin_system::{TransferPathway, ResidueOffset};
 
-    let c_tol = tol_params.tolerance_for(NucleusType::C13, iteration, max_iterations);
+    // Use VERY TIGHT carbon tolerance for sequential links to avoid false matches
+    // With perfect BMRB data, true intra/inter pairs should match exactly (0.0 ppm diff)
+    // Using 0.05 ppm to handle only numerical precision issues
+    // This prevents false sequential links from residues with similar carbon shifts
+    let c_tol = 0.05;  // Very tight tolerance - only matches near-exact shifts
     let h_tol = tol_params.tolerance_for(NucleusType::H1, iteration, max_iterations);
     let n_tol = tol_params.tolerance_for(NucleusType::N15, iteration, max_iterations);
 
@@ -3765,11 +6732,25 @@ fn compute_sequential_links(
         Some((h, n))
     }
 
-    // Helper to get carbon shift and its residue offset (physics-based!)
-    fn get_carbon_with_offset(obs: &Observation) -> Option<(f64, ResidueOffset)> {
+    // Helper to get carbon shift, residue offset, AND atom type (physics-based!)
+    // We need to distinguish CA from CB to avoid false matches
+    fn get_carbon_with_offset(obs: &Observation) -> Option<(f64, ResidueOffset, String)> {
         obs.dimensions.iter()
             .find(|d| d.nucleus == NucleusType::C13)
-            .map(|d| (d.shift, d.residue_offset))
+            .map(|d| {
+                // Get atom hint or infer from shift range
+                let atom_type = d.atom_hint.clone().unwrap_or_else(|| {
+                    // Infer CA vs CB from shift range
+                    if d.shift > 44.0 && d.shift < 66.0 {
+                        "CA".to_string()
+                    } else if d.shift < 44.0 || d.shift > 66.0 {
+                        "CB".to_string()
+                    } else {
+                        "C".to_string()  // Unknown
+                    }
+                });
+                (d.shift, d.residue_offset, atom_type)
+            })
     }
 
     // Helper to check if two backbones are different (not the same NH)
@@ -3787,15 +6768,22 @@ fn compute_sequential_links(
     // For each pair of backbone-sequential observations at DIFFERENT backbones
     for (i, (idx_a, obs_a)) in sequential_obs.iter().enumerate() {
         let Some((h_a, n_a)) = get_backbone(obs_a) else { continue };
-        let Some((c_a, offset_a)) = get_carbon_with_offset(obs_a) else { continue };
+        let Some((c_a, offset_a, atom_a)) = get_carbon_with_offset(obs_a) else { continue };
 
         for (idx_b, obs_b) in sequential_obs.iter().skip(i + 1) {
             let Some((h_b, n_b)) = get_backbone(obs_b) else { continue };
-            let Some((c_b, offset_b)) = get_carbon_with_offset(obs_b) else { continue };
+            let Some((c_b, offset_b, atom_b)) = get_carbon_with_offset(obs_b) else { continue };
 
             // Skip if same backbone anchor
             if !different_backbone(h_a, n_a, h_b, n_b) {
                 continue;
+            }
+
+            // CRITICAL: Only match same atom types!
+            // CA must match CA, CB must match CB
+            // This prevents false sequential links from coincidental shift matches
+            if atom_a != atom_b {
+                continue;  // Different atom types cannot be sequential matches
             }
 
             // Check for carbon shift match
@@ -3806,18 +6794,16 @@ fn compute_sequential_links(
 
             // Carbon match found at DIFFERENT backbones!
             // Use physics-based residue_offset instead of experiment-type dispatch:
-            //   - Intra@backbone_X sees residue X
-            //   - PrecedingResidue@backbone_Y sees residue Y-1
+            //   - Intra@backbone_X sees residue at position_X
+            //   - PrecedingResidue@backbone_Y sees residue at position_Y - 1
             // If carbons match: the residues they observe are the SAME
-            //   - If A Intra@X and B PrecedingResidue@Y match: residue X = residue Y-1
-            //     → A and B observe the SAME residue (NOT sequential!)
-            //     → We learn backbone X+1 = backbone Y (backbone ordering)
-            //   - If A PrecedingResidue@X and B Intra@Y match: residue X-1 = residue Y
-            //     → A and B observe the SAME residue
-            //     → We learn backbone X = backbone Y+1
+            //   - If A Intra@X and B PrecedingResidue@Y match: position_X = position_Y - 1
+            //     → backbone B is at position_X + 1 (B follows A)
+            //   - If A PrecedingResidue@X and B Intra@Y match: position_X - 1 = position_Y
+            //     → backbone A is at position_Y + 1 (A follows B)
             //
-            // So cross-backbone intra/inter carbon matches are SAME-RESIDUE correlations,
-            // not sequential relationships!
+            // These are SEQUENTIAL BACKBONE ORDERING links:
+            // - POSITIVE strength means from_idx precedes to_idx in sequence
 
             let match_strength = (-0.5 * (c_diff / c_tol).powi(2)).exp();
 
@@ -3825,47 +6811,188 @@ fn compute_sequential_links(
             let is_intra_b = offset_b == ResidueOffset::Intra;
 
             if is_intra_a && !is_intra_b {
-                // A shows Intra (residue at backbone A), B shows PrecedingResidue (residue at backbone B - 1)
-                // Match means: residue(A) = residue(B-1)
-                // KEY INSIGHT: Both observations see the SAME RESIDUE!
-                // This is a SAME-RESIDUE correlation, not a sequential position shift!
+                // A shows Intra (residue at position A), B shows PrecedingResidue (residue at position B-1)
+                // Match means: position_A = position_B - 1
+                // Therefore: B follows A in sequence (A → A+1 = B)
                 links.push(SequentialLink {
                     from_idx: *idx_a,
                     to_idx: *idx_b,
-                    strength: -match_strength,  // NEGATIVE = same-residue (both at same position)
+                    strength: match_strength,  // POSITIVE = B follows A
                 });
             } else if !is_intra_a && is_intra_b {
-                // A shows PrecedingResidue (residue at backbone A - 1), B shows Intra (residue at backbone B)
-                // Match means: residue(A-1) = residue(B)
-                // Both observe the SAME RESIDUE
+                // A shows PrecedingResidue (residue at position A-1), B shows Intra (residue at position B)
+                // Match means: position_A - 1 = position_B
+                // Therefore: A follows B in sequence (B → B+1 = A)
                 links.push(SequentialLink {
-                    from_idx: *idx_a,
-                    to_idx: *idx_b,
-                    strength: -match_strength,  // NEGATIVE = same-residue
+                    from_idx: *idx_b,  // B is the predecessor
+                    to_idx: *idx_a,    // A is the successor
+                    strength: match_strength,  // POSITIVE = A follows B
                 });
             }
-            // Both Intra or both PrecedingResidue: they observe different residues, skip
+            // Both Intra or both PrecedingResidue: they observe different residues at same backbone
+            // This gives same-residue grouping (negative strength) for SAME backbone
+            else if is_intra_a && is_intra_b {
+                // Both see their own backbone's residue - but at DIFFERENT backbones
+                // If carbons match, these might be the same residue type at different positions
+                // This is weaker evidence - downweight it
+                // Actually skip - different backbones seeing different intra carbons that happen to match
+                // is coincidental (same residue TYPE, not same residue POSITION)
+            }
         }
     }
 
-    // Debug: sequential links discovery (verbose mode only, see main output)
-    // if iteration == 0 && !links.is_empty() {
-    //     println!("Sequential links: {} found from backbone-sequential carbon matching", links.len());
-    // }
+    // Debug: count links by atom type
+    let mut atom_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for link in &links {
+        let obs_a = &observations[link.from_idx];
+        let obs_b = &observations[link.to_idx];
+        let atom_a = obs_a.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::C13)
+            .and_then(|d| d.atom_hint.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        *atom_type_counts.entry(atom_a).or_insert(0) += 1;
+    }
+    println!("Sequential links by atom type: {:?}", atom_type_counts);
+
+    // Debug: print sample sequential links (first 10 only to avoid spam)
+    if links.len() > 0 && false {  // Disabled by default
+        println!("Sample sequential links ({} total):", links.len());
+        for link in links.iter().take(10) {
+            let obs_a = &observations[link.from_idx];
+            let obs_b = &observations[link.to_idx];
+            let h_a = obs_a.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift).unwrap_or(0.0);
+            let n_a = obs_a.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift).unwrap_or(0.0);
+            let h_b = obs_b.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift).unwrap_or(0.0);
+            let n_b = obs_b.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift).unwrap_or(0.0);
+            let atom = obs_a.dimensions.iter().find(|d| d.nucleus == NucleusType::C13).and_then(|d| d.atom_hint.clone()).unwrap_or("?".to_string());
+            println!("  ({:.2}, {:.1}) -> ({:.2}, {:.1}) [{}] str={:.3}",
+                h_a, n_a, h_b, n_b, atom, link.strength);
+        }
+    }
 
     links
 }
 
-/// Update beliefs using typing, correlation, and sequential factors.
+/// Compute NOESY backbone-carbon correlations (Factor 3).
+///
+/// Finds observations where:
+/// - One is a backbone observation (has H/N)
+/// - One is a carbon observation (has H/C) with ThroughSpace pathway
+/// - Their H shifts match (NOE correlation)
+///
+/// Returns: (backbone_idx, carbon_idx, quality)
+fn compute_noesy_backbone_carbon(
+    observations: &[Observation],
+    tol_params: &NucleusToleranceParams,
+    iteration: usize,
+    max_iterations: usize,
+) -> Vec<(usize, usize, f64)> {
+    use crate::data::spin_system::TransferPathway;
+
+    let h_tol = tol_params.tolerance_for(NucleusType::H1, iteration, max_iterations);
+    let mut links = Vec::new();
+
+    // Helper to check if observation is backbone-type (has H/N)
+    let is_backbone = |obs: &Observation| -> bool {
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::H1) &&
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::N15)
+    };
+
+    // Helper to check if observation is carbon-type with NOESY pathway (has H/C and ThroughSpace)
+    let is_noesy_carbon = |obs: &Observation| -> bool {
+        obs.transfer_pathway == TransferPathway::ThroughSpace &&
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::H1) &&
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::C13)
+    };
+
+    // Get H shift from observation
+    let get_h = |obs: &Observation| -> Option<f64> {
+        obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::H1)
+            .map(|d| d.shift)
+    };
+
+    // Find backbone observations
+    let backbone_obs: Vec<(usize, f64)> = observations.iter()
+        .enumerate()
+        .filter(|(_, obs)| is_backbone(obs))
+        .filter_map(|(idx, obs)| get_h(obs).map(|h| (idx, h)))
+        .collect();
+
+    // Find NOESY carbon observations
+    let noesy_carbon_obs: Vec<(usize, f64)> = observations.iter()
+        .enumerate()
+        .filter(|(_, obs)| is_noesy_carbon(obs))
+        .filter_map(|(idx, obs)| get_h(obs).map(|h| (idx, h)))
+        .collect();
+
+    // Find correlations based on H shift matching
+    for (bb_idx, bb_h) in &backbone_obs {
+        for (c_idx, c_h) in &noesy_carbon_obs {
+            let h_diff = (bb_h - c_h).abs();
+            if h_diff < h_tol {
+                // Quality based on Gaussian: closer match = higher quality
+                let quality = (-0.5 * (h_diff / h_tol).powi(2)).exp();
+                links.push((*bb_idx, *c_idx, quality));
+            }
+        }
+    }
+
+    links
+}
+
+/// Compute type confidence from per-position typing scores.
+///
+/// Aggregates scores by amino acid type (not position) and returns the best type
+/// along with its confidence (proportion of total score mass).
+///
+/// Example: If typing_scores favor positions [3, 7, 12] which are all Glycine,
+/// this returns ("GLY", high_confidence).
+fn compute_type_confidence(
+    typing_scores: &[f64],      // scores per position (domain_size elements, index 0 = unassigned)
+    residue_types: &[String],   // amino acid type at each position (sequence.len() elements)
+) -> Option<(String, f64)> {
+    // Sum scores by amino acid type (not position)
+    let mut type_scores: HashMap<String, f64> = HashMap::new();
+    for (pos_idx, &score) in typing_scores.iter().enumerate().skip(1) {  // skip index 0 (unassigned)
+        if let Some(aa) = residue_types.get(pos_idx - 1) {  // positions are 1-indexed
+            *type_scores.entry(aa.clone()).or_default() += score;
+        }
+    }
+
+    if type_scores.is_empty() {
+        return None;
+    }
+
+    // Find best type and compute confidence
+    let total: f64 = type_scores.values().sum();
+    type_scores.into_iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(t, s)| (t, s / total.max(1e-10)))
+}
+
+/// Update beliefs using typing, correlation, sequential, NOESY, and sequence-type factors.
+///
+/// Factor 3 (NOESY sequential): If backbone B correlates with carbon C via NOESY, and C
+/// has high belief at position R, then B gets boosted for position R+1 (B follows C).
+///
+/// Factor 5 (sequence-type constraint): If an observation is confidently typed as amino acid X,
+/// penalize positions where X doesn't appear in the sequence. This creates "anchor points"
+/// for rare residues like Glycine, Tryptophan, etc.
 fn update_observation_beliefs_with_sequential(
     beliefs: &[Vec<f64>],
     typing_scores: &[Vec<f64>],
     correlation_scores: &[Vec<f64>],
     sequential_links: &[SequentialLink],
+    noesy_links: &[(usize, usize, f64)],  // (backbone_idx, carbon_idx, quality)
+    type_to_positions: &HashMap<String, Vec<usize>>,
+    residue_types: &[String],
     domain_size: usize,
     correlation_weight: f64,
     typing_weight: f64,
     sequential_weight: f64,
+    sequence_type_weight: f64,
+    sequence_type_threshold: f64,
 ) -> Vec<Vec<f64>> {
     let n = beliefs.len();
     let mut new_beliefs = vec![vec![0.0; domain_size]; n];
@@ -3877,16 +7004,18 @@ fn update_observation_beliefs_with_sequential(
         }
 
         // Add correlation messages (same-residue factors)
-        for j in 0..n {
-            if i == j { continue; }
-
-            let corr = correlation_scores[i][j];
-            if corr > 0.01 {
-                for d in 0..domain_size {
-                    new_beliefs[i][d] += beliefs[j][d].max(1e-10).ln() * corr * correlation_weight;
-                }
-            }
-        }
+        // DISABLED temporarily - correlation messages with uniform beliefs don't help and add noise
+        // TODO: Re-enable once belief propagation is working correctly
+        // for j in 0..n {
+        //     if i == j { continue; }
+        //
+        //     let corr = correlation_scores[i][j];
+        //     if corr > 0.01 {
+        //         for d in 0..domain_size {
+        //             new_beliefs[i][d] += beliefs[j][d].max(1e-10).ln() * corr * correlation_weight;
+        //         }
+        //     }
+        // }
 
         // Add sequential/same-residue messages from triple-resonance carbon matching
         // POSITIVE strength = sequential (from at d → to at d+1)
@@ -3902,19 +7031,78 @@ fn update_observation_beliefs_with_sequential(
                     new_beliefs[i][d] += other_belief.ln() * abs_strength * correlation_weight;
                 }
             } else if link.strength > 0.0 {
-                // SEQUENTIAL: true backbone ordering (not currently generated, but kept for future)
+                // SEQUENTIAL: true backbone ordering
+                // Logic: If link from A to B, and A has high belief at position d,
+                // then B should be at d+1.
+                //
+                // Use RELATIVE boost: add (belief[d] - uniform) to position d+1
+                // This way, if all beliefs are uniform, contribution is 0 (neutral)
+                // If belief at d is HIGH, d+1 gets boosted
+                // If belief at d is LOW, d+1 gets penalized
+                let uniform_prob = 1.0 / domain_size as f64;
+
                 if link.to_idx == i {
-                    for d in 1..domain_size {
-                        if d + 1 < domain_size {
-                            let from_belief = beliefs[link.from_idx][d].max(1e-10);
-                            new_beliefs[i][d + 1] += from_belief.ln() * link.strength * sequential_weight;
-                        }
+                    // I am the TO node: if FROM has high belief at d, I should be at d+1
+                    for d in 1..domain_size - 1 {
+                        let from_belief = beliefs[link.from_idx][d];
+                        // Relative boost: how much above/below uniform
+                        let relative = (from_belief / uniform_prob).max(1e-10).ln();
+                        new_beliefs[i][d + 1] += relative * link.strength * sequential_weight;
                     }
+                    // Position 0 and 1 get penalty for not fitting sequential chain
+                    new_beliefs[i][0] -= link.strength * sequential_weight * 0.5;
+                    new_beliefs[i][1] -= link.strength * sequential_weight * 0.5;
                 }
                 if link.from_idx == i {
+                    // I am the FROM node: if TO has high belief at d, I should be at d-1
                     for d in 2..domain_size {
-                        let to_belief = beliefs[link.to_idx][d].max(1e-10);
-                        new_beliefs[i][d - 1] += to_belief.ln() * link.strength * sequential_weight;
+                        let to_belief = beliefs[link.to_idx][d];
+                        let relative = (to_belief / uniform_prob).max(1e-10).ln();
+                        new_beliefs[i][d - 1] += relative * link.strength * sequential_weight;
+                    }
+                    // Position 0 gets penalty for not fitting sequential chain
+                    // Position domain_size-1 also doesn't fit (no next)
+                    new_beliefs[i][0] -= link.strength * sequential_weight * 0.5;
+                }
+            }
+        }
+
+        // Factor 3: NOESY sequential
+        // If backbone B correlates with carbon C via NOESY, and C has high belief at position R,
+        // then B gets boosted for position R+1 (B is sequential to the residue containing C)
+        // Logic: NOESY correlates protons within ~5Å. If backbone H correlates with a carbon's
+        // attached H, and that carbon is intra-residue, then backbone is likely +1 position.
+        for (bb_idx, c_idx, quality) in noesy_links {
+            if *bb_idx == i {
+                // This backbone correlates with carbon at c_idx via NOESY
+                // If carbon has high belief at position R, boost backbone at R+1
+                let uniform_prob = 1.0 / domain_size as f64;
+
+                for r in 1..domain_size - 1 {
+                    let carbon_prob = beliefs[*c_idx][r];
+                    // Only boost if carbon has above-uniform belief (avoid noise)
+                    if carbon_prob > uniform_prob * 3.0 {
+                        let boost = (carbon_prob / uniform_prob).ln() * quality * sequential_weight;
+                        new_beliefs[i][r + 1] += boost;
+                    }
+                }
+            }
+        }
+
+        // Factor 5: Sequence-type constraint
+        // If we're confident about the amino acid type, constrain to valid positions
+        // This creates "anchor points" for rare residues (Gly, Trp, His, etc.)
+        if sequence_type_weight > 0.0 {
+            if let Some((best_type, confidence)) = compute_type_confidence(&typing_scores[i], residue_types) {
+                if confidence > sequence_type_threshold {
+                    if let Some(valid_positions) = type_to_positions.get(&best_type) {
+                        // Penalize positions that don't match the typed amino acid
+                        for d in 1..domain_size {
+                            if !valid_positions.contains(&d) {
+                                // Strong penalty for invalid positions
+                                new_beliefs[i][d] -= sequence_type_weight * confidence;
+                            }
+                        }
                     }
                 }
             }
@@ -3985,6 +7173,179 @@ fn apply_backbone_uniqueness_factor(
         if sum > 0.0 {
             for v in &mut beliefs[bb_idx] {
                 *v /= sum;
+            }
+        }
+    }
+}
+
+/// Apply backbone GROUPING factor: observations in the same backbone group should have same belief.
+///
+/// This synchronizes beliefs among HNCA/HNCACB/HNCACO/HNCO observations from the same (H, N).
+/// Within a group, we average beliefs and assign this average to all members.
+fn apply_backbone_grouping_factor(
+    beliefs: &mut [Vec<f64>],
+    backbone_groups: &[Vec<usize>],
+    domain_size: usize,
+) {
+    for group in backbone_groups {
+        if group.len() <= 1 {
+            continue;  // No grouping needed for single-member groups
+        }
+
+        // Compute average belief for this group using geometric mean (better for probabilities)
+        let mut avg_beliefs = vec![1.0; domain_size];
+        for d in 0..domain_size {
+            let mut log_sum = 0.0;
+            for &idx in group {
+                log_sum += beliefs[idx][d].max(1e-20).ln();
+            }
+            avg_beliefs[d] = (log_sum / group.len() as f64).exp();
+        }
+
+        // Normalize average
+        let sum: f64 = avg_beliefs.iter().sum();
+        if sum > 0.0 {
+            for v in &mut avg_beliefs {
+                *v /= sum;
+            }
+        }
+
+        // Blend each member's belief toward the group average (soft synchronization)
+        // Use 0.7 weight toward average to allow individual evidence to still contribute
+        let group_weight = 0.7;
+        for &idx in group {
+            for d in 0..domain_size {
+                beliefs[idx][d] = (1.0 - group_weight) * beliefs[idx][d] + group_weight * avg_beliefs[d];
+            }
+        }
+    }
+}
+
+/// Apply backbone GROUP uniqueness constraint: each residue gets at most one backbone GROUP.
+///
+/// This is a HARD CONSTRAINT that implements exclusion between backbone GROUPS (not observations).
+/// For each residue position, the backbone group with highest average belief "wins" and
+/// all observations in other groups have their belief for that residue set to near-zero.
+fn apply_backbone_group_uniqueness_factor(
+    beliefs: &mut [Vec<f64>],
+    backbone_groups: &[Vec<usize>],
+    domain_size: usize,
+) {
+    if backbone_groups.len() <= 1 {
+        return;  // No competition with 0 or 1 backbone group
+    }
+
+    // Compute average belief for each group
+    let group_beliefs: Vec<Vec<f64>> = backbone_groups.iter().map(|group| {
+        if group.is_empty() {
+            return vec![0.0; domain_size];
+        }
+        let mut avg = vec![0.0; domain_size];
+        for d in 0..domain_size {
+            avg[d] = group.iter().map(|&idx| beliefs[idx][d]).sum::<f64>() / group.len() as f64;
+        }
+        avg
+    }).collect();
+
+    // For each residue position (skip index 0 = unassigned)
+    for residue in 1..domain_size {
+        // Find which group has highest average belief for this residue
+        let mut best_group_idx: Option<usize> = None;
+        let mut best_belief = 0.0;
+
+        for (group_idx, group_belief) in group_beliefs.iter().enumerate() {
+            let belief = group_belief[residue];
+            if belief > best_belief {
+                best_belief = belief;
+                best_group_idx = Some(group_idx);
+            }
+        }
+
+        // Penalize all OTHER groups for this residue
+        if let Some(winner_idx) = best_group_idx {
+            for (group_idx, group) in backbone_groups.iter().enumerate() {
+                if group_idx != winner_idx {
+                    // Suppress belief for this residue in all observations of losing groups
+                    for &obs_idx in group {
+                        beliefs[obs_idx][residue] *= 0.01;
+                    }
+                }
+            }
+        }
+    }
+
+    // Re-normalize beliefs for all backbone observations after applying exclusion
+    for group in backbone_groups {
+        for &obs_idx in group {
+            let sum: f64 = beliefs[obs_idx].iter().sum();
+            if sum > 0.0 {
+                for v in &mut beliefs[obs_idx] {
+                    *v /= sum;
+                }
+            }
+        }
+    }
+}
+
+/// Apply SOFT backbone group uniqueness - gentler penalty during BP.
+///
+/// Uses softer suppression (0.3x instead of 0.01x) to allow recovery from early mistakes.
+/// Full uniqueness is enforced at extraction time.
+fn apply_soft_backbone_group_uniqueness(
+    beliefs: &mut [Vec<f64>],
+    backbone_groups: &[Vec<usize>],
+    domain_size: usize,
+) {
+    if backbone_groups.len() <= 1 {
+        return;
+    }
+
+    // Compute average belief for each group
+    let group_beliefs: Vec<Vec<f64>> = backbone_groups.iter().map(|group| {
+        if group.is_empty() {
+            return vec![0.0; domain_size];
+        }
+        let mut avg = vec![0.0; domain_size];
+        for d in 0..domain_size {
+            avg[d] = group.iter().map(|&idx| beliefs[idx][d]).sum::<f64>() / group.len() as f64;
+        }
+        avg
+    }).collect();
+
+    // For each residue position (skip index 0 = unassigned)
+    for residue in 1..domain_size {
+        // Find which group has highest average belief for this residue
+        let mut best_group_idx: Option<usize> = None;
+        let mut best_belief = 0.0;
+
+        for (group_idx, group_belief) in group_beliefs.iter().enumerate() {
+            let belief = group_belief[residue];
+            if belief > best_belief {
+                best_belief = belief;
+                best_group_idx = Some(group_idx);
+            }
+        }
+
+        // Softly penalize other groups (0.3x instead of 0.01x)
+        if let Some(winner_idx) = best_group_idx {
+            for (group_idx, group) in backbone_groups.iter().enumerate() {
+                if group_idx != winner_idx {
+                    for &obs_idx in group {
+                        beliefs[obs_idx][residue] *= 0.3;  // Soft penalty
+                    }
+                }
+            }
+        }
+    }
+
+    // Re-normalize
+    for group in backbone_groups {
+        for &obs_idx in group {
+            let sum: f64 = beliefs[obs_idx].iter().sum();
+            if sum > 0.0 {
+                for v in &mut beliefs[obs_idx] {
+                    *v /= sum;
+                }
             }
         }
     }

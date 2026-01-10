@@ -55,13 +55,13 @@ struct Cli {
 
     /// Exclude specific experiment types (comma-separated).
     /// Options: 15n-hsqc, 13c-hsqc, tocsy, noesy, hsqc-tocsy-15n, hsqc-tocsy-13c,
-    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hnca, hncacb, cbcaconh, hbhaconh
+    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh
     #[arg(long, global = true, conflicts_with = "only")]
     exclude: Option<String>,
 
     /// Only use specific experiment types (comma-separated).
     /// Options: 15n-hsqc, 13c-hsqc, tocsy, noesy, hsqc-tocsy-15n, hsqc-tocsy-13c,
-    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hnca, hncacb, cbcaconh, hbhaconh
+    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh
     #[arg(long, global = true, conflicts_with = "exclude")]
     only: Option<String>,
 }
@@ -102,6 +102,20 @@ impl ExperimentFilter {
             ExperimentFilter::Only(set) => set.contains(&exp_type.to_lowercase()),
         }
     }
+}
+
+/// Ring flip exchange mode for aromatic amino acids (PHE/TYR).
+///
+/// Aromatic rings undergo 180° rotations ("ring flips"). When this is fast
+/// on the NMR timescale, CD1/CD2 and CE1/CE2 appear equivalent (single peak).
+/// When slow, they become distinguishable (two separate peaks).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum AromaticExchangeMode {
+    /// Fast exchange: CD1≡CD2, CE1≡CE2 (treat as equivalent)
+    #[default]
+    Fast,
+    /// Slow exchange: CD1≠CD2, CE1≠CE2 (treat as distinct)
+    Slow,
 }
 
 #[derive(Subcommand)]
@@ -246,6 +260,8 @@ struct GroundTruth {
     expected_atom_shifts: HashMap<(i32, String), f64>,
     /// Sequence string for looking up residue type
     sequence: String,
+    /// Per-residue aromatic ring flip exchange mode (only for PHE/TYR)
+    residue_ring_mode: HashMap<i32, AromaticExchangeMode>,
 }
 
 impl GroundTruth {
@@ -257,6 +273,7 @@ impl GroundTruth {
             peak_to_reference: HashMap::new(),
             expected_atom_shifts: HashMap::new(),
             sequence: sequence.to_string(),
+            residue_ring_mode: HashMap::new(),
         }
     }
 
@@ -269,6 +286,16 @@ impl GroundTruth {
         }
     }
 
+    /// Set the aromatic ring flip mode for a residue (only meaningful for PHE/TYR)
+    fn set_ring_mode(&mut self, residue: i32, mode: AromaticExchangeMode) {
+        self.residue_ring_mode.insert(residue, mode);
+    }
+
+    /// Get the aromatic ring flip mode for a residue (defaults to Fast)
+    fn get_ring_mode(&self, residue: i32) -> AromaticExchangeMode {
+        self.residue_ring_mode.get(&residue).copied().unwrap_or_default()
+    }
+
     /// Record expected shift for a specific atom position (from KDE mode)
     fn set_expected_shift(&mut self, residue: i32, atom: &str, shift: f64) {
         self.expected_atom_shifts.insert((residue, atom.to_string()), shift);
@@ -278,8 +305,10 @@ impl GroundTruth {
         self.peak_to_residue.insert(peak.id, residue);
         // Normalize stereo-equivalent atoms for fair evaluation
         // Pass residue type so we can handle Ile CG1/CG2 correctly
+        // Pass ring mode so we can handle PHE/TYR slow ring flip correctly
         let aa = self.get_aa(residue);
-        self.peak_to_atom.insert(peak.id, normalize_stereo_atoms(atom, aa));
+        let ring_mode = self.get_ring_mode(residue);
+        self.peak_to_atom.insert(peak.id, normalize_stereo_atoms(atom, aa, ring_mode));
         // Store chemical shifts
         let shifts = peak.get_shifts_labeled();
         self.peak_to_shifts.insert(peak.id, shifts);
@@ -296,20 +325,29 @@ impl GroundTruth {
 /// In NMR, we cannot distinguish between stereo-equivalent atoms like:
 /// - VAL: CG1/CG2, HG1*/HG2* (two equivalent methyl groups)
 /// - LEU: CD1/CD2, HD1*/HD2* (two equivalent methyl groups)
-/// - PHE/TYR: CD1/CD2, CE1/CE2 (ring symmetry)
+/// - PHE/TYR: CD1/CD2, CE1/CE2 (ring symmetry) - ONLY in fast exchange!
 /// So treating CG1 as CG2 (same residue) should count as correct.
 ///
 /// IMPORTANT: Isoleucine (I) is special - CG1 and CG2 are NOT stereo-equivalent:
 /// - CG1 (~27 ppm): methylene carbon with HG12, HG13
 /// - CG2 (~17 ppm): methyl carbon with HG21, HG22, HG23
 /// These have a 10 ppm difference and must be distinguished!
-fn normalize_stereo_atoms(atom_desc: &str, aa: Option<char>) -> String {
+///
+/// IMPORTANT: PHE/TYR with slow ring flip have distinguishable CD1/CD2 and CE1/CE2.
+/// When `ring_mode` is `Slow`, these are NOT normalized.
+fn normalize_stereo_atoms(atom_desc: &str, aa: Option<char>, ring_mode: AromaticExchangeMode) -> String {
     let mut result = atom_desc.to_string();
     let is_ile = aa.map_or(false, |c| c == 'I');
+    let is_trp = aa.map_or(false, |c| c == 'W');
+    let is_phe_tyr_slow = aa.map_or(false, |c| {
+        (c == 'F' || c == 'Y') && ring_mode == AromaticExchangeMode::Slow
+    });
 
     // Normalize carbon names: CG1->CG, CG2->CG, CD1->CD, CD2->CD, etc.
     // But keep CA, CB as-is since they're not stereo-equivalent
     // For ILE: Do NOT normalize CG1/CG2 (they're chemically distinct)
+    // For TRP: Do NOT normalize aromatic carbons (asymmetric indole ring)
+    // For PHE/TYR slow exchange: Do NOT normalize CD1/CD2, CE1/CE2 (distinguishable)
     let stereo_carbons: &[(&str, &str)] = if is_ile {
         // ILE: CG1/CG2 are NOT equivalent, CD1 is unique (no CD2)
         // Only normalize aromatic carbons (CE1/CE2/CZ2/CZ3) which don't apply to ILE
@@ -317,8 +355,21 @@ fn normalize_stereo_atoms(atom_desc: &str, aa: Option<char>) -> String {
             ("CE1", "CE"), ("CE2", "CE"), ("CE3", "CE"),
             ("CZ2", "CZ"), ("CZ3", "CZ"),
         ]
+    } else if is_trp {
+        // TRP: Asymmetric indole ring - NO aromatic carbons are equivalent
+        // CD1 (~127), CD2 (~128), CE2 (~138), CE3 (~120), CZ2 (~114), CZ3 (~122), CH2 (~124)
+        // Only aliphatic CG1/CG2 normalization (though TRP doesn't have these)
+        &[
+            ("CG1", "CG"), ("CG2", "CG"),
+        ]
+    } else if is_phe_tyr_slow {
+        // PHE/TYR with slow ring flip: aromatic carbons NOT equivalent
+        // Only normalize aliphatic methyls (CG1/CG2 for other residues, not PHE/TYR)
+        &[
+            ("CG1", "CG"), ("CG2", "CG"),
+        ]
     } else {
-        // VAL/LEU/other: CG1/CG2 ARE equivalent methyls
+        // PHE/TYR fast exchange, VAL/LEU/other: symmetric rings, equivalent methyls
         &[
             ("CG1", "CG"), ("CG2", "CG"),
             ("CD1", "CD"), ("CD2", "CD"),
@@ -333,6 +384,8 @@ fn normalize_stereo_atoms(atom_desc: &str, aa: Option<char>) -> String {
 
     // Normalize proton names attached to stereo-equivalent carbons
     // For ILE: Keep HG1x and HG2x separate since they're on different carbons
+    // For TRP: Keep aromatic protons separate (asymmetric indole ring)
+    // For PHE/TYR slow: Keep HD1/HD2, HE1/HE2 separate (on distinguishable carbons)
     let stereo_protons: &[(&str, &str)] = if is_ile {
         // ILE: Protons within same methyl/methylene group are equivalent,
         // but HG1x (on CG1) vs HG2x (on CG2) are NOT
@@ -350,8 +403,24 @@ fn normalize_stereo_atoms(atom_desc: &str, aa: Option<char>) -> String {
             ("HZ2", "HZ"), ("HZ3", "HZ"),
             ("HA2", "HA"), ("HA3", "HA"),
         ]
+    } else if is_trp {
+        // TRP: Asymmetric indole - aromatic protons are NOT equivalent
+        // HD1 (on CD1), HE1 (on NE1), HE3 (on CE3), HZ2 (on CZ2), HZ3 (on CZ3), HH2 (on CH2)
+        // Only methylene protons (HB2/HB3) are equivalent
+        &[
+            ("HB2", "HB"), ("HB3", "HB"),
+            ("HA2", "HA"), ("HA3", "HA"),
+        ]
+    } else if is_phe_tyr_slow {
+        // PHE/TYR slow ring flip: aromatic protons NOT equivalent
+        // HD1/HD2 and HE1/HE2 are on distinguishable carbons CD1/CD2 and CE1/CE2
+        // Only methylene protons (HB2/HB3) are equivalent
+        &[
+            ("HB2", "HB"), ("HB3", "HB"),
+            ("HA2", "HA"), ("HA3", "HA"),
+        ]
     } else {
-        // VAL/LEU/other: HG1x and HG2x are equivalent (both methyl groups equivalent)
+        // PHE/TYR fast exchange, VAL/LEU/other: HG1x and HG2x are equivalent
         &[
             // Methyl protons (3 equivalent H per methyl, both methyls equivalent)
             ("HG11", "HG"), ("HG12", "HG"), ("HG13", "HG"),
@@ -374,6 +443,74 @@ fn normalize_stereo_atoms(atom_desc: &str, aa: Option<char>) -> String {
     }
 
     result
+}
+
+/// Detect ring flip mode for a PHE/TYR residue based on aromatic carbon peaks.
+///
+/// Aromatic rings in PHE and TYR can exhibit slow exchange on the NMR timescale,
+/// causing CD1/CD2 (and CE1/CE2) to appear as distinct peaks rather than a single
+/// averaged peak. This function detects this by looking for two peaks in the
+/// aromatic CD region with significant chemical shift difference.
+///
+/// # Arguments
+/// * `aa_type` - Single-letter amino acid code
+/// * `carbon_peaks` - Carbon chemical shifts observed for this residue
+/// * `threshold_ppm` - Minimum shift difference to indicate slow exchange (e.g., 0.5 ppm)
+///
+/// # Returns
+/// `AromaticExchangeMode::Slow` if two distinct CD peaks detected, `Fast` otherwise.
+fn detect_ring_flip_mode(
+    aa_type: char,
+    carbon_peaks: &[f64],
+    threshold_ppm: f64,
+) -> AromaticExchangeMode {
+    // Only PHE and TYR have symmetric aromatic rings subject to ring flips
+    if aa_type != 'F' && aa_type != 'Y' {
+        return AromaticExchangeMode::Fast;
+    }
+
+    // Define aromatic CD region for this amino acid
+    // PHE CD: ~131.5 ppm (σ=1.8), TYR CD: ~132.5 ppm (σ=1.6)
+    let cd_range = match aa_type {
+        'F' => (128.0, 136.0), // PHE CD: ~131.5 ± 4
+        'Y' => (128.0, 138.0), // TYR CD: ~132.5 ± 4
+        _ => return AromaticExchangeMode::Fast,
+    };
+
+    // Find peaks in CD region
+    let cd_peaks: Vec<f64> = carbon_peaks
+        .iter()
+        .copied()
+        .filter(|&c| c >= cd_range.0 && c <= cd_range.1)
+        .collect();
+
+    match cd_peaks.len() {
+        0 | 1 => AromaticExchangeMode::Fast, // No data or single peak = fast exchange
+        2 => {
+            let delta = (cd_peaks[0] - cd_peaks[1]).abs();
+            if delta > threshold_ppm {
+                AromaticExchangeMode::Slow
+            } else {
+                AromaticExchangeMode::Fast
+            }
+        }
+        _ => {
+            // >2 peaks: look for any pair with significant difference
+            // This handles cases where both CD and CE are in range
+            let mut max_delta = 0.0f64;
+            for i in 0..cd_peaks.len() {
+                for j in (i + 1)..cd_peaks.len() {
+                    let delta = (cd_peaks[i] - cd_peaks[j]).abs();
+                    max_delta = max_delta.max(delta);
+                }
+            }
+            if max_delta > threshold_ppm {
+                AromaticExchangeMode::Slow
+            } else {
+                AromaticExchangeMode::Fast
+            }
+        }
+    }
 }
 
 /// Result of comparing assignment to ground truth
@@ -598,7 +735,7 @@ fn run_bmrb_mode(entry_id: u32, residue_range: Option<String>, output_json: Opti
     print_data_density(&shifts, &sequence);
 
     // Generate peaks from deposited shifts
-    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
         generate_peaks_from_bmrb(&shifts, filter);
 
     println!(
@@ -611,95 +748,11 @@ fn run_bmrb_mode(entry_id: u32, residue_range: Option<String>, output_json: Opti
         hsqc_tocsy_13c.len()
     );
     println!(
-        "3D peaks: {} 15N-HSQC-TOCSY-3D, {} 13C-HSQC-TOCSY-3D, {} HNCO, {} HNCA, {} HNCACB, {} CBCACONH, {} HBHACONH",
+        "3D peaks: {} 15N-HSQC-TOCSY-3D, {} 13C-HSQC-TOCSY-3D, {} HNCO, {} HN(CA)CO, {} HNCA, {} HNCACB, {} CBCACONH, {} HBHACONH",
         hsqc_tocsy_15n_3d.len(),
         hsqc_tocsy_13c_3d.len(),
         hnco.len(),
-        hnca.len(),
-        hncacb.len(),
-        cbcaconh.len(),
-        hbhaconh.len()
-    );
-
-    let start = Instant::now();
-    let results = run_unified_assignment(
-        &hsqc_15n, &hsqc_13c, &tocsy, &noesy, &hsqc_tocsy_15n, &hsqc_tocsy_13c,
-        &hsqc_tocsy_15n_3d, &hsqc_tocsy_13c_3d,
-        &hnco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
-        &sequence, &params
-    );
-    let elapsed = start.elapsed();
-    let timing_ms = elapsed.as_secs_f64() * 1000.0;
-
-    println!("Assignment completed in {:.1}ms", timing_ms);
-
-    // Evaluate and print
-    let summary = evaluate_results(&results, &ground_truth, &sequence);
-    print_results(&summary, &sequence, &format!("BMRB Entry {}", entry_id));
-
-    // Write JSON output if requested
-    if let Some(json_path) = output_json {
-        let json_output = build_json_output(
-            entry_id,
-            residue_range,
-            &sequence,
-            timing_ms,
-            &summary,
-            hsqc_15n.len(),
-            hsqc_13c.len(),
-            tocsy.len(),
-            noesy.len(),
-        );
-
-        match serde_json::to_string_pretty(&json_output) {
-            Ok(json_str) => {
-                if let Err(e) = std::fs::write(&json_path, json_str) {
-                    eprintln!("Error writing JSON output: {}", e);
-                } else {
-                    println!("JSON results written to: {}", json_path.display());
-                }
-            }
-            Err(e) => eprintln!("Error serializing JSON: {}", e),
-        }
-    }
-}
-
-fn run_synthetic_mode(sequence: &str, noise: f64, verbose: bool, filter: &ExperimentFilter) {
-    println!("Generating synthetic data for sequence: {}", sequence);
-    println!("Noise level: {:.1}%", noise * 100.0);
-
-    // Print filter info
-    match filter {
-        ExperimentFilter::All => {}
-        ExperimentFilter::Exclude(set) => {
-            println!("Excluding experiments: {:?}", set);
-        }
-        ExperimentFilter::Only(set) => {
-            println!("Only using experiments: {:?}", set);
-        }
-    }
-
-    // Load KDE database
-    let kde = KDEDatabase::load_embedded();
-
-    // Generate peaks from KDE modes
-    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
-        generate_synthetic_peaks(sequence, &kde, noise, filter);
-
-    println!(
-        "Generated peaks: {} 15N-HSQC, {} 13C-HSQC, {} TOCSY, {} NOESY, {} 15N-HSQC-TOCSY, {} 13C-HSQC-TOCSY",
-        hsqc_15n.len(),
-        hsqc_13c.len(),
-        tocsy.len(),
-        noesy.len(),
-        hsqc_tocsy_15n.len(),
-        hsqc_tocsy_13c.len()
-    );
-    println!(
-        "3D peaks: {} 15N-HSQC-TOCSY-3D, {} 13C-HSQC-TOCSY-3D, {} HNCO, {} HNCA, {} HNCACB, {} CBCACONH, {} HBHACONH",
-        hsqc_tocsy_15n_3d.len(),
-        hsqc_tocsy_13c_3d.len(),
-        hnco.len(),
+        hncaco.len(),
         hnca.len(),
         hncacb.len(),
         cbcaconh.len(),
@@ -759,6 +812,211 @@ fn run_synthetic_mode(sequence: &str, noise: f64, verbose: bool, filter: &Experi
             observations.push(obs);
         }
     }
+    for peak in &hncaco {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hbhaconh {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hsqc_tocsy_15n_3d {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hsqc_tocsy_13c_3d {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+
+    println!("Total observations: {}", observations.len());
+
+    let tol_params = NucleusToleranceParams::default();
+
+    let start = Instant::now();
+    let results = run_observation_assignment(&observations, &sequence, &params, &tol_params);
+    let elapsed = start.elapsed();
+    let timing_ms = elapsed.as_secs_f64() * 1000.0;
+
+    println!("Assignment completed in {:.1}ms", timing_ms);
+
+    // Evaluate and print
+    let summary = evaluate_observation_results(&results, &ground_truth, &sequence);
+    print_results(&summary, &sequence, &format!("BMRB Entry {}", entry_id));
+
+    // DEBUG: Count results by experiment type and trace CB
+    {
+        use nmraster_lib::data::spin_system::PeakExperimentType;
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut cb_assigned: Vec<(i32, i32)> = Vec::new();  // (assigned_res, actual_res)
+        for r in &results {
+            *counts.entry(format!("{:?}", r.experiment_type)).or_default() += 1;
+
+            // Check if this is a CB peak
+            if let Some(atom_desc) = ground_truth.peak_to_atom.get(&r.observation_id) {
+                if atom_desc.contains("CB") {
+                    if let Some(&actual) = ground_truth.peak_to_residue.get(&r.observation_id) {
+                        cb_assigned.push((r.assigned_residue, actual));
+                    }
+                }
+            }
+        }
+        let mut sorted: Vec<_> = counts.into_iter().collect();
+        sorted.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        println!("\nResults by experiment type:");
+        for (exp, count) in sorted {
+            println!("  {}: {}", exp, count);
+        }
+
+        // Summarize CB assignments
+        let cb_correct = cb_assigned.iter().filter(|(a, e)| a == e).count();
+        println!("\nCB assignments: {} correct / {} total ({:.1}%)",
+            cb_correct, cb_assigned.len(),
+            if cb_assigned.is_empty() { 0.0 } else { 100.0 * cb_correct as f64 / cb_assigned.len() as f64 });
+
+        // Show CB assignment errors (first 10)
+        println!("\nCB assignment errors (assigned vs actual):");
+        for (assigned, actual) in cb_assigned.iter().take(10) {
+            let delta = *assigned - *actual;
+            println!("  Assigned to {} but should be {} (off by {})", assigned, actual, delta);
+        }
+    }
+
+    // Print the atom-centric chemical shift table
+    print_chemical_shift_table(&results, &ground_truth, &sequence);
+
+    // Write JSON output if requested
+    if let Some(json_path) = output_json {
+        let json_output = build_json_output(
+            entry_id,
+            residue_range,
+            &sequence,
+            timing_ms,
+            &summary,
+            hsqc_15n.len(),
+            hsqc_13c.len(),
+            tocsy.len(),
+            noesy.len(),
+        );
+
+        match serde_json::to_string_pretty(&json_output) {
+            Ok(json_str) => {
+                if let Err(e) = std::fs::write(&json_path, json_str) {
+                    eprintln!("Error writing JSON output: {}", e);
+                } else {
+                    println!("JSON results written to: {}", json_path.display());
+                }
+            }
+            Err(e) => eprintln!("Error serializing JSON: {}", e),
+        }
+    }
+}
+
+fn run_synthetic_mode(sequence: &str, noise: f64, verbose: bool, filter: &ExperimentFilter) {
+    println!("Generating synthetic data for sequence: {}", sequence);
+    println!("Noise level: {:.1}%", noise * 100.0);
+
+    // Print filter info
+    match filter {
+        ExperimentFilter::All => {}
+        ExperimentFilter::Exclude(set) => {
+            println!("Excluding experiments: {:?}", set);
+        }
+        ExperimentFilter::Only(set) => {
+            println!("Only using experiments: {:?}", set);
+        }
+    }
+
+    // Load KDE database
+    let kde = KDEDatabase::load_embedded();
+
+    // Generate peaks from KDE modes
+    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+        generate_synthetic_peaks(sequence, &kde, noise, filter);
+
+    println!(
+        "Generated peaks: {} 15N-HSQC, {} 13C-HSQC, {} TOCSY, {} NOESY, {} 15N-HSQC-TOCSY, {} 13C-HSQC-TOCSY",
+        hsqc_15n.len(),
+        hsqc_13c.len(),
+        tocsy.len(),
+        noesy.len(),
+        hsqc_tocsy_15n.len(),
+        hsqc_tocsy_13c.len()
+    );
+    println!(
+        "3D peaks: {} 15N-HSQC-TOCSY-3D, {} 13C-HSQC-TOCSY-3D, {} HNCO, {} HN(CA)CO, {} HNCA, {} HNCACB, {} CBCACONH, {} HBHACONH",
+        hsqc_tocsy_15n_3d.len(),
+        hsqc_tocsy_13c_3d.len(),
+        hnco.len(),
+        hncaco.len(),
+        hnca.len(),
+        hncacb.len(),
+        cbcaconh.len(),
+        hbhaconh.len()
+    );
+
+    // UNIFIED OBSERVATION MODEL: Convert ALL peaks to observations
+    let mut observations: Vec<Observation> = Vec::new();
+
+    for peak in &hsqc_15n {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hsqc_13c {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &tocsy {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &noesy {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hsqc_tocsy_15n {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hsqc_tocsy_13c {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hnca {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hncacb {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &cbcaconh {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hnco {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hncaco {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
     for peak in &hbhaconh {
         if let Some(obs) = Observation::from_unlabeled_peak(peak) {
             observations.push(obs);
@@ -812,6 +1070,7 @@ fn generate_peaks_from_bmrb(
     Vec<UnlabeledPeak>,  // hsqc_tocsy_15n_3d
     Vec<UnlabeledPeak>,  // hsqc_tocsy_13c_3d
     Vec<UnlabeledPeak>,  // hnco
+    Vec<UnlabeledPeak>,  // hncaco
     Vec<UnlabeledPeak>,  // hnca
     Vec<UnlabeledPeak>,  // hncacb
     Vec<UnlabeledPeak>,  // cbcaconh
@@ -827,6 +1086,7 @@ fn generate_peaks_from_bmrb(
     let mut hsqc_tocsy_15n_3d = Vec::new();
     let mut hsqc_tocsy_13c_3d = Vec::new();
     let mut hnco = Vec::new();
+    let mut hncaco = Vec::new();
     let mut hnca = Vec::new();
     let mut hncacb = Vec::new();
     let mut cbcaconh = Vec::new();
@@ -851,6 +1111,12 @@ fn generate_peaks_from_bmrb(
     let sequence: String = residue_codes.iter().map(|(_, c)| *c).collect();
 
     let mut ground_truth = GroundTruth::new(&sequence);
+
+    // Record all deposited shifts as expected shifts for chemical shift table
+    // For BMRB data, deposited shifts ARE the ground truth
+    for shift in shifts {
+        ground_truth.set_expected_shift(shift.residue_seq_code, &shift.atom_name, shift.shift_value);
+    }
 
     // Carbon-proton pairs: carbon name -> possible proton names
     let carbon_proton_pairs: &[(&str, &[&str])] = &[
@@ -1121,16 +1387,33 @@ fn generate_peaks_from_bmrb(
         let ca_prev = prev_shifts.iter().find(|s| s.atom_name == "CA").map(|s| s.shift_value);
         let cb_prev = prev_shifts.iter().find(|s| s.atom_name == "CB").map(|s| s.shift_value);
         let co_prev = prev_shifts.iter().find(|s| s.atom_name == "C").map(|s| s.shift_value);
+        let co_curr = curr_shifts.iter().find(|s| s.atom_name == "C").map(|s| s.shift_value);
         let ha_prev = prev_shifts.iter().find(|s| s.atom_name == "HA" || s.atom_name == "HA2").map(|s| s.shift_value);
         let hb_prev = prev_shifts.iter().find(|s| s.atom_name == "HB" || s.atom_name == "HB2").map(|s| s.shift_value);
 
         // HNCO: (H, N, CO) - correlates NH(i) with CO(i-1)
-        // Ground truth: the CO belongs to residue i-1
+        // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for C
         if filter.should_include("hnco") {
             if let Some(co) = co_prev {
                 let peak = UnlabeledPeak::hnco(h_val, n_val, co, 1.0);
-                ground_truth.register(&peak, curr_seq - 1, "H/N/C(i-1)");
+                ground_truth.register(&peak, curr_seq, "H/N/C(i-1)");
                 hnco.push(peak);
+            }
+        }
+
+        // HN(CA)CO: (H, N, CO) - correlates NH(i) with CO(i) strong, CO(i-1) weak
+        if filter.should_include("hncaco") {
+            // Intra-residue CO(i) - strong
+            if let Some(co) = co_curr {
+                let peak = UnlabeledPeak::hncaco(h_val, n_val, co, 1.0);
+                ground_truth.register(&peak, curr_seq, "H/N/C(i)");
+                hncaco.push(peak);
+            }
+            // Inter-residue CO(i-1) - weak (~30%)
+            if let Some(co) = co_prev {
+                let peak = UnlabeledPeak::hncaco(h_val, n_val, co, 0.3);
+                ground_truth.register(&peak, curr_seq, "H/N/C(i-1)");
+                hncaco.push(peak);
             }
         }
 
@@ -1156,7 +1439,8 @@ fn generate_peaks_from_bmrb(
                     ("N".to_string(), n_val),
                     ("CA".to_string(), ca),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CA(i-1)", reference);
+                // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for CA
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)", reference);
                 hnca.push(peak);
             }
         }
@@ -1186,7 +1470,7 @@ fn generate_peaks_from_bmrb(
                 hncacb.push(peak);
             }
             // Inter-residue CA(i-1) - negative
-            // Ground truth: the carbon BELONGS to residue i-1, not current backbone
+            // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for CA
             if let Some(ca) = ca_prev {
                 let peak = UnlabeledPeak::hncacb(h_val, n_val, ca, -0.3);
                 let reference = vec![
@@ -1194,7 +1478,7 @@ fn generate_peaks_from_bmrb(
                     ("N".to_string(), n_val),
                     ("CA".to_string(), ca),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CA(i-1)-", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)-", reference);
                 hncacb.push(peak);
             }
             // Inter-residue CB(i-1) - negative
@@ -1205,22 +1489,22 @@ fn generate_peaks_from_bmrb(
                     ("N".to_string(), n_val),
                     ("CB".to_string(), cb),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CB(i-1)-", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CB(i-1)-", reference);
                 hncacb.push(peak);
             }
         }
 
         // CBCACONH: (H, N, CA/CB) - only i-1 carbons
-        // Ground truth: ALL peaks show previous residue's carbons
+        // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for carbons
         if filter.should_include("cbcaconh") {
             if let Some(ca) = ca_prev {
                 let peak = UnlabeledPeak::cbcaconh(h_val, n_val, ca, 1.0);
-                ground_truth.register(&peak, curr_seq - 1, "H/N/CA(i-1)");
+                ground_truth.register(&peak, curr_seq, "H/N/CA(i-1)");
                 cbcaconh.push(peak);
             }
             if let Some(cb) = cb_prev {
                 let peak = UnlabeledPeak::cbcaconh(h_val, n_val, cb, 0.8);
-                ground_truth.register(&peak, curr_seq - 1, "H/N/CB(i-1)");
+                ground_truth.register(&peak, curr_seq, "H/N/CB(i-1)");
                 cbcaconh.push(peak);
             }
         }
@@ -1242,7 +1526,7 @@ fn generate_peaks_from_bmrb(
         }
     }
 
-    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth)
+    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth)
 }
 
 /// Generate synthetic peaks from KDE modes
@@ -1262,6 +1546,7 @@ fn generate_synthetic_peaks(
     Vec<UnlabeledPeak>,  // hsqc_tocsy_15n_3d
     Vec<UnlabeledPeak>,  // hsqc_tocsy_13c_3d
     Vec<UnlabeledPeak>,  // hnco
+    Vec<UnlabeledPeak>,  // hncaco
     Vec<UnlabeledPeak>,  // hnca
     Vec<UnlabeledPeak>,  // hncacb
     Vec<UnlabeledPeak>,  // cbcaconh
@@ -1280,6 +1565,7 @@ fn generate_synthetic_peaks(
     let mut hsqc_tocsy_15n_3d = Vec::new();
     let mut hsqc_tocsy_13c_3d = Vec::new();
     let mut hnco = Vec::new();
+    let mut hncaco = Vec::new();
     let mut hnca = Vec::new();
     let mut hncacb = Vec::new();
     let mut cbcaconh = Vec::new();
@@ -1368,12 +1654,21 @@ fn generate_synthetic_peaks(
                 let n_shift = add_noise(n, 4.0, &mut rng);
 
                 // Record expected shifts only for experiments that can observe them
-                // N is only observable via 15N-HSQC
-                if filter.should_include("15n-hsqc") {
+                // H and N are observable via 15N-HSQC, TOCSY (H only), and all triple-resonance experiments
+                let has_hn_experiment = filter.should_include("15n-hsqc") ||
+                    filter.should_include("hnca") ||
+                    filter.should_include("hncacb") ||
+                    filter.should_include("hnco") ||
+                    filter.should_include("cbcaconh") ||
+                    filter.should_include("hbhaconh") ||
+                    filter.should_include("hsqc-tocsy-15n") ||
+                    filter.should_include("hsqc-tocsy-15n-3d");
+
+                if has_hn_experiment {
                     ground_truth.set_expected_shift(seq_code, "N", n);
                 }
-                // H (amide) is observable via 15N-HSQC or TOCSY
-                if filter.should_include("15n-hsqc") || filter.should_include("tocsy") {
+                // H (amide) is observable via above experiments plus TOCSY
+                if has_hn_experiment || filter.should_include("tocsy") {
                     ground_truth.set_expected_shift(seq_code, "H", h);
                 }
 
@@ -1463,6 +1758,16 @@ fn generate_synthetic_peaks(
             let co_shift = add_noise(co_mode, 2.0, &mut rng);
             co_shifts.insert(seq_code, co_shift);
             co_refs.insert(seq_code, co_mode);  // KDE mode reference
+            // Record expected CO shift for atom-centric table
+            // HNCO creates peaks for CO(i-1) when processing residue i.
+            // So C-terminal residue won't have an HNCO peak - don't expect it for HNCO alone.
+            // HN(CA)CO provides intra-residue CO(i), so ALL residues (including C-terminal) get CO.
+            let is_c_terminal = seq_code == sequence.len() as i32;
+            let hncaco_enabled = filter.should_include("hncaco");
+            let hnco_enabled = filter.should_include("hnco");
+            if hncaco_enabled || (hnco_enabled && !is_c_terminal) {
+                ground_truth.set_expected_shift(seq_code, "C", co_mode);
+            }
         }
 
         // Also collect any protons not attached to carbons (for completeness)
@@ -1674,6 +1979,7 @@ fn generate_synthetic_peaks(
         let ca_prev = ca_shifts.get(&prev_seq).copied();
         let cb_prev = cb_shifts.get(&prev_seq).copied();
         let co_prev = co_shifts.get(&prev_seq).copied();
+        let co_curr = co_shifts.get(&curr_seq).copied();
         let ha_prev_val = ha_shifts.get(&prev_seq).copied();
         let hb_prev_val = hb_shifts.get(&prev_seq).copied();
         // Reference values (KDE modes) for carbons/protons
@@ -1682,6 +1988,7 @@ fn generate_synthetic_peaks(
         let ca_prev_ref = ca_refs.get(&prev_seq).copied();
         let cb_prev_ref = cb_refs.get(&prev_seq).copied();
         let co_prev_ref = co_refs.get(&prev_seq).copied();
+        let co_curr_ref = co_refs.get(&curr_seq).copied();
         let ha_prev_ref = ha_refs.get(&prev_seq).copied();
         let hb_prev_ref = hb_refs.get(&prev_seq).copied();
 
@@ -1697,8 +2004,42 @@ fn generate_synthetic_peaks(
                     ("N".to_string(), n_r),
                     ("C".to_string(), co_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/C(i-1)", reference);
+                // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for C
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/C(i-1)", reference);
                 hnco.push(peak);
+            }
+        }
+
+        // HN(CA)CO: (H, N, CO) - correlates NH(i) with CO(i) strong, CO(i-1) weak
+        // NOTE: BP assigns based on H/N anchor position (curr_seq), so we register
+        // ALL peaks to curr_seq. The "(i-1)" in atom_desc tells extraction where C goes.
+        if filter.should_include("hncaco") {
+            // Intra-residue CO(i) - strong
+            if let (Some(co), Some(h_r), Some(n_r), Some(co_r)) =
+                (co_curr, h_ref_val, n_ref_val, co_curr_ref)
+            {
+                let peak = UnlabeledPeak::hncaco(h_val, n_val, co, 1.0);
+                let reference = vec![
+                    ("H".to_string(), h_r),
+                    ("N".to_string(), n_r),
+                    ("C".to_string(), co_r),
+                ];
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/C(i)", reference);
+                hncaco.push(peak);
+            }
+            // Inter-residue CO(i-1) - weak (~30%)
+            if let (Some(co), Some(h_r), Some(n_r), Some(co_r)) =
+                (co_prev, h_ref_val, n_ref_val, co_prev_ref)
+            {
+                let peak = UnlabeledPeak::hncaco(h_val, n_val, co, 0.3);
+                let reference = vec![
+                    ("H".to_string(), h_r),
+                    ("N".to_string(), n_r),
+                    ("C".to_string(), co_r),
+                ];
+                // Register to curr_seq (where H/N are), not curr_seq-1
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/C(i-1)", reference);
+                hncaco.push(peak);
             }
         }
 
@@ -1722,13 +2063,13 @@ fn generate_synthetic_peaks(
                 (ca_prev, h_ref_val, n_ref_val, ca_prev_ref)
             {
                 let peak = UnlabeledPeak::hnca(h_val, n_val, ca, 0.3);
-                // Ground truth: the carbon BELONGS to residue i-1
                 let reference = vec![
                     ("H".to_string(), h_r),
                     ("N".to_string(), n_r),
                     ("CA".to_string(), ca_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CA(i-1)", reference);
+                // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for CA
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)", reference);
                 hnca.push(peak);
             }
         }
@@ -1762,7 +2103,7 @@ fn generate_synthetic_peaks(
                 hncacb.push(peak);
             }
             // Inter-residue CA(i-1) - negative
-            // Ground truth: the carbon BELONGS to residue i-1, not current backbone
+            // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for CA
             if let (Some(ca), Some(h_r), Some(n_r), Some(ca_r)) =
                 (ca_prev, h_ref_val, n_ref_val, ca_prev_ref)
             {
@@ -1772,7 +2113,7 @@ fn generate_synthetic_peaks(
                     ("N".to_string(), n_r),
                     ("CA".to_string(), ca_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CA(i-1)-", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)-", reference);
                 hncacb.push(peak);
             }
             // Inter-residue CB(i-1) - negative
@@ -1785,13 +2126,13 @@ fn generate_synthetic_peaks(
                     ("N".to_string(), n_r),
                     ("CB".to_string(), cb_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CB(i-1)-", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CB(i-1)-", reference);
                 hncacb.push(peak);
             }
         }
 
         // CBCACONH: (H, N, CA/CB) - only i-1 carbons
-        // Ground truth: ALL peaks show previous residue's carbons
+        // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for carbons
         if filter.should_include("cbcaconh") {
             if let (Some(ca), Some(h_r), Some(n_r), Some(ca_r)) =
                 (ca_prev, h_ref_val, n_ref_val, ca_prev_ref)
@@ -1802,7 +2143,7 @@ fn generate_synthetic_peaks(
                     ("N".to_string(), n_r),
                     ("CA".to_string(), ca_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CA(i-1)", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)", reference);
                 cbcaconh.push(peak);
             }
             if let (Some(cb), Some(h_r), Some(n_r), Some(cb_r)) =
@@ -1814,12 +2155,13 @@ fn generate_synthetic_peaks(
                     ("N".to_string(), n_r),
                     ("CB".to_string(), cb_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq - 1, "H/N/CB(i-1)", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CB(i-1)", reference);
                 cbcaconh.push(peak);
             }
         }
 
         // HBHACONH: (H, N, HA/HB) - only i-1 protons
+        // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for protons
         if filter.should_include("hbhaconh") {
             if let (Some(ha), Some(h_r), Some(n_r), Some(ha_r)) =
                 (ha_prev_val, h_ref_val, n_ref_val, ha_prev_ref)
@@ -1848,7 +2190,7 @@ fn generate_synthetic_peaks(
         }
     }
 
-    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth)
+    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth)
 }
 
 /// Evaluate assignment results against ground truth
@@ -2168,6 +2510,35 @@ fn print_results(summary: &TestSummary, sequence: &str, mode_desc: &str) {
 // Note: print_atom_table was removed - using print_chemical_shift_table instead
 // for industrial-standard output format
 
+/// Statistics for averaged chemical shift values
+struct ShiftStatistics {
+    mean: f64,
+    std_dev: f64,
+    std_error: f64,
+    count: usize,
+}
+
+/// Calculate statistics from a collection of chemical shift values
+fn calculate_shift_statistics(shifts: &[f64]) -> ShiftStatistics {
+    let count = shifts.len();
+    if count == 0 {
+        return ShiftStatistics { mean: 0.0, std_dev: 0.0, std_error: 0.0, count: 0 };
+    }
+
+    let mean = shifts.iter().sum::<f64>() / count as f64;
+
+    let variance = if count > 1 {
+        shifts.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (count - 1) as f64
+    } else {
+        0.0
+    };
+
+    let std_dev = variance.sqrt();
+    let std_error = if count > 1 { std_dev / (count as f64).sqrt() } else { 0.0 };
+
+    ShiftStatistics { mean, std_dev, std_error, count }
+}
+
 /// Print chemical shift table: for each atom position, show expected vs assigned shift
 /// Industrial-standard format with clear visual hierarchy
 fn print_chemical_shift_table(
@@ -2190,26 +2561,40 @@ fn print_chemical_shift_table(
     // Sequential experiments (HBHACONH, CBCACONH, HNCO) have backbone H/N from
     // residue i but are assigned to residue i-1 - we must NOT use their H/N values.
 
-    let mut assigned_shifts: HashMap<(i32, String), f64> = HashMap::new();
+    let mut assigned_shifts: HashMap<(i32, String), Vec<f64>> = HashMap::new();
     let mut backbone_assigned: HashSet<i32> = HashSet::new(); // Track which residues have backbone H/N
 
-    // First pass: Process backbone-only experiments (15N-HSQC) first
+    use nmraster_lib::data::spin_system::PeakExperimentType;
+
+    // First pass: Process backbone experiments for H/N
+    // This includes 15N-HSQC AND intra-residue HNCA/HNCACO peaks
     for result in results {
         let assigned_res = result.assigned_residue;
         if assigned_res <= 0 {
             continue;
         }
 
-        // Only process 15N-HSQC for backbone H/N
-        if result.experiment_type == nmraster_lib::data::spin_system::PeakExperimentType::Hsqc15N {
+        // Check if this is a backbone H/N source
+        let is_backbone_hn = match result.experiment_type {
+            PeakExperimentType::Hsqc15N => true,
+            PeakExperimentType::Hnca | PeakExperimentType::Hncaco => {
+                // Only intra-residue peaks (atom_desc doesn't contain "(i-1)")
+                ground_truth.peak_to_atom.get(&result.observation_id)
+                    .map(|desc| !desc.contains("(i-1)"))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+
+        if is_backbone_hn {
             if let Some(shifts) = ground_truth.peak_to_shifts.get(&result.observation_id) {
                 for (nucleus_name, shift_val) in shifts {
                     let atom_name = match nucleus_name.as_str() {
                         "H" | "HN" => "H".to_string(),
                         "N" | "N15" => "N".to_string(),
-                        _ => continue,
+                        _ => continue,  // Skip CA/CO in first pass
                     };
-                    assigned_shifts.insert((assigned_res, atom_name), *shift_val);
+                    assigned_shifts.entry((assigned_res, atom_name)).or_default().push(*shift_val);
                 }
                 backbone_assigned.insert(assigned_res);
             }
@@ -2231,30 +2616,37 @@ fn print_chemical_shift_table(
                     // Map nucleus name to atom name based on context
                     let atom_name = map_nucleus_to_atom(nucleus_name, atom_desc);
 
-                    // Skip backbone H/N from sequential experiments where they belong to
-                    // residue i but the observation is assigned to residue i-1.
-                    // TOCSY, HNCA, HNCACB etc. have H/N from the same residue, so allow them.
-                    if (atom_name == "H" || atom_name == "N") {
-                        use nmraster_lib::data::spin_system::PeakExperimentType;
-                        let is_sequential_inter = matches!(result.experiment_type,
-                            PeakExperimentType::Cbcaconh |
-                            PeakExperimentType::Hbhaconh |
-                            PeakExperimentType::Hnco
-                        );
-                        if is_sequential_inter {
-                            continue;
-                        }
-                    }
+                    // Handle inter-residue experiments where H/N belong to residue i
+                    // but other atoms (CA/CB/HA/HB/CO) belong to residue i-1.
+                    // The peak is assigned to i-1, so we need to extract H/N to i-1+1 = i
+                    let is_inter_peak = atom_desc.contains("(i-1)");
 
-                    // Skip TOCSY-derived protons (H_tocsy, H_ali) for shift table
-                    // These are correlation protons, not direct measurements
-                    if atom_name.starts_with("H_") {
-                        continue;
-                    }
+                    // For inter-residue peaks, atoms are offset from the assigned residue:
+                    // - H/N belong to assigned residue (where they anchor)
+                    // - Other atoms (CA/CB/C) belong to assigned_res - 1 (preceding residue)
+                    let target_res = if is_inter_peak && atom_name != "H" && atom_name != "N" {
+                        // Carbon/proton from preceding residue
+                        assigned_res - 1
+                    } else {
+                        // H/N or intra atoms stay at assigned residue
+                        assigned_res
+                    };
 
-                    let key = (assigned_res, atom_name);
-                    // Only insert if not already assigned (first wins for sidechain)
-                    assigned_shifts.entry(key).or_insert(*shift_val);
+                    // Note: H_tocsy and H_ali are now properly mapped to actual atoms
+                    // by map_nucleus_to_atom(), so we don't filter them out anymore
+
+                    // IMPORTANT: Normalize atom_name based on the ASSIGNED residue's type
+                    // This ensures that when a peak is mis-assigned (e.g., TRP's CD2 assigned to F),
+                    // the atom name is stored with F's normalization rules (CD2→CD).
+                    // Otherwise, direct lookup for (F, "CD2") would find TRP's values when
+                    // F's own CD2 peaks are stored as (F, "CD") due to PHE normalization.
+                    let target_aa = ground_truth.get_aa(target_res);
+                    let target_ring_mode = ground_truth.get_ring_mode(target_res);
+                    let normalized_atom = normalize_stereo_atoms(&atom_name, target_aa, target_ring_mode);
+
+                    let key = (target_res, normalized_atom);
+                    // Collect all observations for averaging
+                    assigned_shifts.entry(key).or_default().push(*shift_val);
                 }
             }
         }
@@ -2277,6 +2669,8 @@ fn print_chemical_shift_table(
         atom_name: String,
         expected: f64,
         assigned: Option<f64>,
+        std_error: Option<f64>,
+        count: usize,
         delta: Option<f64>,
         is_match: bool,
     }
@@ -2291,24 +2685,28 @@ fn print_chemical_shift_table(
             '?'
         };
 
-        let assigned = assigned_shifts.get(&(*residue, atom_name.clone())).copied()
+        // Get all shift values for this atom and calculate statistics
+        let shifts_vec = assigned_shifts.get(&(*residue, atom_name.clone()))
+            .cloned()
             .or_else(|| {
-                // Pass AA for Ile-aware normalization
+                // Try normalized stereo atoms
                 let aa_opt = if aa != '?' { Some(aa) } else { None };
-                let normalized = normalize_stereo_atoms(atom_name, aa_opt);
-                assigned_shifts.get(&(*residue, normalized)).copied()
+                let ring_mode = ground_truth.get_ring_mode(*residue);
+                let normalized = normalize_stereo_atoms(atom_name, aa_opt, ring_mode);
+                assigned_shifts.get(&(*residue, normalized)).cloned()
             });
 
         total_atoms += 1;
 
-        let (delta, is_match) = if let Some(assigned_val) = assigned {
-            let d = (assigned_val - expected).abs();
+        let (assigned, std_error, count, delta, is_match) = if let Some(shifts) = shifts_vec {
+            let stats = calculate_shift_statistics(&shifts);
+            let d = (stats.mean - expected).abs();
             let tolerance = if atom_name.starts_with('H') { 0.1 } else if atom_name.starts_with('N') { 1.0 } else { 1.0 };
             let m = d < tolerance;
             if m { correct_atoms += 1; }
-            (Some(d), m)
+            (Some(stats.mean), Some(stats.std_error), stats.count, Some(d), m)
         } else {
-            (None, false)
+            (None, None, 0, None, false)
         };
 
         results_by_residue.entry(*residue).or_default().push(AtomResult {
@@ -2317,6 +2715,8 @@ fn print_chemical_shift_table(
             atom_name: atom_name.clone(),
             expected,
             assigned,
+            std_error,
+            count,
             delta,
             is_match,
         });
@@ -2342,9 +2742,9 @@ fn print_chemical_shift_table(
     println!();
 
     // Table header
-    println!("  {:>3} {:3}  {:6}   {:>8}   {:>8}   {:>6}  {}",
-             "Res", "AA", "Atom", "Expected", "Assigned", "Delta", "");
-    println!("  {}", "─".repeat(66));
+    println!("  {:>3} {:3}  {:6}   {:>8}   {:>8}  {:>6}  {:>2}   {:>6}  {}",
+             "Res", "AA", "Atom", "Expected", "Assigned", "StdErr", "N", "Delta", "");
+    println!("  {}", "─".repeat(78));
 
     // Print residues
     let mut residues: Vec<_> = results_by_residue.keys().copied().collect();
@@ -2361,7 +2761,7 @@ fn print_chemical_shift_table(
         let res_color = if res_acc >= 95.0 { GREEN } else if res_acc >= 80.0 { YELLOW } else { RED };
 
         // Residue header with summary
-        println!("  {}{:>3} {:3}{} {:>52} {}{:>3}/{}{}{}",
+        println!("  {}{:>3} {:3}{} {:>64} {}{:>3}/{}{}{}",
                  BOLD, res, aa, RESET, "", res_color, res_correct, res_total, RESET, "");
 
         // Print each atom
@@ -2372,29 +2772,40 @@ fn print_chemical_shift_table(
                 format!("{}MISS{}", RED, RESET)
             };
 
-            let (assigned_str, delta_str) = if let (Some(a), Some(d)) = (result.assigned, result.delta) {
-                (format!("{:>8.3}", a), format!("{:>6.3}", d))
+            let (assigned_str, stderr_str, n_str, delta_str) = if let (Some(a), Some(d)) = (result.assigned, result.delta) {
+                let se = result.std_error.map(|e| format!("{:>6.3}", e)).unwrap_or_else(|| format!("{:>6}", "-"));
+                let n = if result.count > 0 { format!("{:>2}", result.count) } else { format!("{:>2}", "-") };
+                (format!("{:>8.3}", a), se, n, format!("{:>6.3}", d))
             } else {
-                (format!("{:>8}", "-"), format!("{:>6}", "-"))
+                (format!("{:>8}", "-"), format!("{:>6}", "-"), format!("{:>2}", "-"), format!("{:>6}", "-"))
             };
 
-            println!("          {:6}   {:>8.3}   {}   {}  {}",
-                     result.atom_name, result.expected, assigned_str, delta_str, match_indicator);
+            println!("          {:6}   {:>8.3}   {}  {}  {}   {}  {}",
+                     result.atom_name, result.expected, assigned_str, stderr_str, n_str, delta_str, match_indicator);
         }
     }
 
-    println!("  {}", "─".repeat(66));
+    println!("  {}", "─".repeat(78));
     println!();
 }
 
 /// Map nucleus name (from peak) to atom name based on atom description
 fn map_nucleus_to_atom(nucleus: &str, atom_desc: &str) -> String {
-    // atom_desc examples: "H/N", "CA/HA", "CB/HB2", "H1/H2" (TOCSY)
+    // atom_desc examples: "H/N", "CA/HA", "CB/HB2", "H1/H2" (TOCSY), "N/HA" (HSQC-TOCSY)
     let parts: Vec<&str> = atom_desc.split('/').collect();
 
     match nucleus {
         "H" | "HN" => {
-            // Backbone amide proton
+            // Check if this is a C-H pair like "CA/HA" (13C-HSQC)
+            // In that case, "H" refers to the attached proton, not backbone amide
+            if parts.len() == 2 && parts[0].starts_with('C') && parts[1].starts_with('H') {
+                return parts[1].to_string();  // Return HA, HB2, HD1, etc.
+            }
+            // For 3D experiments like "CA/HA/HB2", the anchor H is at position 1
+            if parts.len() == 3 && parts[0].starts_with('C') && parts[1].starts_with('H') {
+                return parts[1].to_string();  // Return anchor proton
+            }
+            // Default: backbone amide proton
             "H".to_string()
         }
         "N" | "N15" => "N".to_string(),
@@ -2402,9 +2813,11 @@ fn map_nucleus_to_atom(nucleus: &str, atom_desc: &str) -> String {
         "CB" | "C13_CB" => "CB".to_string(),
         "CO" | "C13_CO" => "C".to_string(), // Carbonyl
         "C" => {
-            // Could be CA, CB, etc - try to get from atom_desc
-            if parts.len() >= 1 && parts[0].starts_with('C') {
-                parts[0].to_string()
+            // Could be CA, CB, CG, etc - get from atom_desc
+            // Examples: "H/N/CA(i-1)" -> "CA", "H/N/CB(i-1)" -> "CB"
+            if let Some(carbon) = parts.iter().find(|p| p.starts_with('C')) {
+                // Strip "(i-1)" suffix if present
+                carbon.trim_end_matches("(i-1)").to_string()
             } else {
                 "C".to_string()
             }
@@ -2412,7 +2825,7 @@ fn map_nucleus_to_atom(nucleus: &str, atom_desc: &str) -> String {
         "HA" | "HA2" | "HA3" => nucleus.to_string(),
         "HB" | "HB2" | "HB3" => nucleus.to_string(),
         "H1" => {
-            // TOCSY - first proton, try to get from atom_desc
+            // TOCSY - first proton, get from atom_desc
             if parts.len() >= 1 {
                 parts[0].to_string()
             } else {
@@ -2426,6 +2839,33 @@ fn map_nucleus_to_atom(nucleus: &str, atom_desc: &str) -> String {
             } else {
                 nucleus.to_string()
             }
+        }
+        "H_tocsy" => {
+            // HSQC-TOCSY correlation proton - extract actual atom from atom_desc
+            // For 3D experiments like "CA/HA/HB2", atom_desc format is:
+            //   "Carbon/AnchorH/CorrelationH"
+            // The H_tocsy shift corresponds to the LAST proton (correlation target)
+            // Examples:
+            //   "N/HA" -> "HA" (2D: N-HA correlation)
+            //   "CA/HA/HB2" -> "HB2" (3D: correlation to HB2)
+            //   "CA/HA/H" -> "H" (3D: correlation to backbone H!)
+            parts.iter()
+                .filter(|p| p.starts_with('H'))
+                .last()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| nucleus.to_string())
+        }
+        "H_ali" => {
+            // HBHACONH aliphatic proton - extract HA/HB from atom_desc
+            // Examples: "H/N/HA(i-1)" -> "HA", "H/N/HB2(i-1)" -> "HB2"
+            parts.iter()
+                .filter(|p| p.starts_with("HA") || p.starts_with("HB"))
+                .last()
+                .map(|s| {
+                    // Strip "(i-1)" suffix if present
+                    s.trim_end_matches("(i-1)").to_string()
+                })
+                .unwrap_or_else(|| nucleus.to_string())
         }
         _ => nucleus.to_string()
     }
@@ -2630,7 +3070,7 @@ fn run_batch_mode(entry_id: u32, output_dir: PathBuf, windows: &str, verbose: bo
             let sequence = extract_sequence(&window_shifts);
 
             // Generate peaks
-            let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+            let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
                 generate_peaks_from_bmrb(&window_shifts, filter);
 
             // Run assignment with timing
@@ -2938,7 +3378,7 @@ fn run_grid_search_mode(
 
                 for (range, shifts) in &stretch_data {
                     let sequence = extract_sequence(shifts);
-                    let (hsqc_15n, hsqc_13c, tocsy_peaks, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+                    let (hsqc_15n, hsqc_13c, tocsy_peaks, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
                         generate_peaks_from_bmrb(shifts, filter);
 
                     let start = Instant::now();

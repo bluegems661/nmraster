@@ -30,8 +30,10 @@ pub enum PeakExperimentType {
     HsqcTocsy13C3D,
 
     // 3D Triple-resonance experiments for backbone assignment
-    /// HNCO: (H, N, CO) - correlates NH(i) with CO(i-1)
+    /// HNCO: (H, N, CO) - correlates NH(i) with CO(i-1) only
     Hnco,
+    /// HN(CA)CO: (H, N, CO) - correlates NH(i) with CO(i) strong, CO(i-1) weak
+    Hncaco,
     /// HNCA: (H, N, CA) - correlates NH(i) with CA(i) strong, CA(i-1) weak
     Hnca,
     /// HNCACB: (H, N, CA/CB) - correlates NH(i) with CA/CB(i) positive, CA/CB(i-1) negative
@@ -206,9 +208,16 @@ impl UnlabeledPeak {
     // 3D Triple-resonance experiment constructors
 
     /// Create an HNCO peak (H, N, CO).
-    /// Peak at NH(i) correlates with CO(i-1).
+    /// Peak at NH(i) correlates with CO(i-1) only.
     pub fn hnco(h_ppm: f64, n_ppm: f64, co_ppm: f64, intensity: f64) -> Self {
         Self::new(vec![h_ppm, n_ppm, co_ppm], intensity, PeakExperimentType::Hnco)
+    }
+
+    /// Create an HN(CA)CO peak (H, N, CO).
+    /// Peak at NH(i) correlates with CO(i) strong, CO(i-1) weak (~30%).
+    /// Similar to HNCA but for carbonyl carbons instead of CA.
+    pub fn hncaco(h_ppm: f64, n_ppm: f64, co_ppm: f64, intensity: f64) -> Self {
+        Self::new(vec![h_ppm, n_ppm, co_ppm], intensity, PeakExperimentType::Hncaco)
     }
 
     /// Create an HNCA peak (H, N, CA).
@@ -301,7 +310,15 @@ impl UnlabeledPeak {
                 }
             }
             PeakExperimentType::Hnco => {
-                // [H, N, CO]
+                // [H, N, CO] - inter-residue CO(i-1) only
+                vec![
+                    ("H".to_string(), self.position_ppm.get(0).copied().unwrap_or(0.0)),
+                    ("N".to_string(), self.position_ppm.get(1).copied().unwrap_or(0.0)),
+                    ("CO".to_string(), self.position_ppm.get(2).copied().unwrap_or(0.0)),
+                ]
+            }
+            PeakExperimentType::Hncaco => {
+                // [H, N, CO] - intra CO(i) strong, inter CO(i-1) weak
                 vec![
                     ("H".to_string(), self.position_ppm.get(0).copied().unwrap_or(0.0)),
                     ("N".to_string(), self.position_ppm.get(1).copied().unwrap_or(0.0)),
