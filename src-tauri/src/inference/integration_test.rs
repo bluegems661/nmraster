@@ -255,7 +255,7 @@ mod tests {
             hsqc_15n, hsqc_13c, tocsy, noesy,
             &empty, &empty,  // HSQC-TOCSY 2D
             &empty, &empty,  // HSQC-TOCSY 3D
-            &empty, &empty, &empty, &empty, &empty,  // 3D triple-resonance
+            &empty, &empty, &empty, &empty, &empty, &empty,  // 3D triple-resonance: hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh
             sequence, &params
         );
 
@@ -489,7 +489,7 @@ mod tests {
             &hsqc_15n, &hsqc_13c, &tocsy, &noesy,
             &empty, &empty,  // HSQC-TOCSY 2D
             &empty, &empty,  // HSQC-TOCSY 3D
-            &empty, &empty, &empty, &empty, &empty,  // 3D triple-resonance
+            &empty, &empty, &empty, &empty, &empty, &empty,  // 3D triple-resonance: hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh
             sequence, &params
         );
 

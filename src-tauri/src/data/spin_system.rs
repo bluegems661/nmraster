@@ -334,9 +334,11 @@ impl UnlabeledPeak {
                 ]
             }
             PeakExperimentType::Hncacb => {
-                // [H, N, C] - C is CA or CB depending on shift range
+                // [H, N, C] - CA vs CB encoded by intensity SIGN (not shift range!)
+                // Positive intensity = CA, Negative intensity = CB
+                // This is critical: Ser/Thr CB (~60-70 ppm) overlaps with CA range
                 let c_shift = self.position_ppm.get(2).copied().unwrap_or(0.0);
-                let c_name = if c_shift > 45.0 && c_shift < 70.0 { "CA" } else { "CB" };
+                let c_name = if self.intensity > 0.0 { "CA" } else { "CB" };
                 vec![
                     ("H".to_string(), self.position_ppm.get(0).copied().unwrap_or(0.0)),
                     ("N".to_string(), self.position_ppm.get(1).copied().unwrap_or(0.0)),
@@ -344,9 +346,10 @@ impl UnlabeledPeak {
                 ]
             }
             PeakExperimentType::Cbcaconh => {
-                // [H, N, C] - C is CA or CB depending on shift range
+                // [H, N, C] - CA vs CB encoded by intensity SIGN (not shift range!)
+                // Positive intensity = CA, Negative intensity = CB
                 let c_shift = self.position_ppm.get(2).copied().unwrap_or(0.0);
-                let c_name = if c_shift > 45.0 && c_shift < 70.0 { "CA" } else { "CB" };
+                let c_name = if self.intensity > 0.0 { "CA" } else { "CB" };
                 vec![
                     ("H".to_string(), self.position_ppm.get(0).copied().unwrap_or(0.0)),
                     ("N".to_string(), self.position_ppm.get(1).copied().unwrap_or(0.0)),

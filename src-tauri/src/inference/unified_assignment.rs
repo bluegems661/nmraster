@@ -343,18 +343,18 @@ impl Observation {
 
             Hncacb => {
                 if peak.position_ppm.len() < 3 { return None; }
-                // Positive intensity = intra (i), negative = inter (i-1)
-                let is_intra = peak.intensity > 0.0;
+                // HNCACB encoding:
+                // - SIGN determines CA vs CB: positive = CA, negative = CB (CB is inverted)
+                // - MAGNITUDE determines intra vs inter: |intensity| > 0.5 = intra (i), <= 0.5 = inter (i-1)
+                let is_ca = peak.intensity > 0.0;
+                let is_intra = peak.intensity.abs() > 0.5;
                 let carbon_offset = if is_intra { ResidueOffset::Intra } else { ResidueOffset::PrecedingResidue };
                 let is_seq = !is_intra;
 
-                // Distinguish CA from CB using chemical shift:
-                // - CA: typically 50-65 ppm for most residues
-                // - CB: typically <50 ppm (Ala ~18, most others 25-45)
-                // Exception: Ser/Thr CB can be ~62-64 ppm, but this is rare enough
-                // that the heuristic shift >= 50 → CA works well for backbone assignment
+                // Use sign to determine CA vs CB (not chemical shift threshold!)
+                // This correctly handles Ser/Thr CB (~60-70 ppm) which would be misclassified by shift alone
                 let carbon_shift = peak.position_ppm[2];
-                let (atom_hint, atom_constraint) = if carbon_shift >= 50.0 {
+                let (atom_hint, atom_constraint) = if is_ca {
                     (Some("CA".to_string()), AtomConstraint::Exact("CA".to_string()))
                 } else {
                     (Some("CB".to_string()), AtomConstraint::Exact("CB".to_string()))
@@ -389,10 +389,10 @@ impl Observation {
             Cbcaconh => {
                 if peak.position_ppm.len() < 3 { return None; }
                 // CBCACONH ALWAYS shows i-1 carbons (inter-residue only)
-
-                // Distinguish CA from CB using chemical shift (same as HNCACB)
+                // Use sign encoding consistent with HNCACB: positive = CA, negative = CB
+                let is_ca = peak.intensity > 0.0;
                 let carbon_shift = peak.position_ppm[2];
-                let (atom_hint, atom_constraint) = if carbon_shift >= 50.0 {
+                let (atom_hint, atom_constraint) = if is_ca {
                     (Some("CA".to_string()), AtomConstraint::Exact("CA".to_string()))
                 } else {
                     (Some("CB".to_string()), AtomConstraint::Exact("CB".to_string()))
@@ -1099,13 +1099,15 @@ fn propose_sa_move(
             })
             .collect();
 
-        if let Some(&link) = violated.choose(rng) {
+        if !violated.is_empty() {
+            // Pick a random violated link
+            let link = violated[rng.gen_range(0..violated.len())];
             // Try to fix this link by moving one of the groups
             if rng.gen_bool(0.5) {
                 if let Some(pos_to) = assignment[link.to_group] {
                     SAMove::Relocate {
                         group: link.from_group,
-                        new_pos: pos_to.saturating_sub(1).max(1),
+                        new_pos: pos_to.saturating_sub(1).max(1usize),
                     }
                 } else {
                     SAMove::Swap {
@@ -1128,7 +1130,7 @@ fn propose_sa_move(
             // No violations - small random perturbation
             let group = rng.gen_range(0..assignment.len());
             if let Some(pos) = assignment[group] {
-                let delta: i32 = *[-1i32, 1].choose(rng).unwrap();
+                let delta: i32 = if rng.gen_bool(0.5) { -1 } else { 1 };
                 let new_pos = ((pos as i32 + delta).max(1) as usize).min(sequence_len);
                 SAMove::Relocate { group, new_pos }
             } else {
@@ -1784,37 +1786,37 @@ pub fn run_group_level_bp(
             let mut has_outgoing_links = false;
 
             // Incoming links: if 'from' is at pos i, I should be at pos i+1
+            // Link strength is log(LR) from Bayesian scoring - use exp(strength) as multiplier
             for &link_idx in &links_to[g] {
                 let link = &sequential_links[link_idx];
-                if link.max_shift_diff > current_tol {
-                    continue;
-                }
+                // Links were already filtered by LR threshold during construction
+                // Use the strength directly (it's log(LR))
                 active_links += 1;
                 has_incoming_links = true;
 
                 let from_g = link.from_group;
-                let effective_strength = link.strength * (1.0 - link.avg_shift_diff / current_tol).max(0.0);
+                // strength = log(LR), so exp(strength) = LR
+                // Scale down for numerical stability: use strength directly as multiplier
+                let lr_factor = link.strength;  // log(LR), typically 2.94-8.83
 
                 for pos in 2..domain_size {
                     let from_prob = beliefs[from_g][pos - 1];
-                    seq_msg_incoming[pos] *= 1.0 + effective_strength * from_prob;
+                    // Boost belief if predecessor is likely at pos-1
+                    seq_msg_incoming[pos] *= 1.0 + lr_factor * from_prob;
                 }
             }
 
             // Outgoing links: if 'to' is at pos i+1, I should be at pos i
             for &link_idx in &links_from[g] {
                 let link = &sequential_links[link_idx];
-                if link.max_shift_diff > current_tol {
-                    continue;
-                }
                 has_outgoing_links = true;
 
                 let to_g = link.to_group;
-                let effective_strength = link.strength * (1.0 - link.avg_shift_diff / current_tol).max(0.0);
+                let lr_factor = link.strength;
 
                 for pos in 1..(domain_size - 1) {
                     let to_prob = beliefs[to_g][pos + 1];
-                    seq_msg_outgoing[pos] *= 1.0 + effective_strength * to_prob;
+                    seq_msg_outgoing[pos] *= 1.0 + lr_factor * to_prob;
                 }
             }
 
@@ -1833,9 +1835,9 @@ pub fn run_group_level_bp(
             }
 
             // Combine: typing * sequential_in * sequential_out
-            // If no sequential links, typing dominates
-            let typing_weight = 3.0;  // Typing is primary evidence
-            let seq_weight = 1.0;  // Sequential connectivity from carbon matches
+            // Balance typing and sequential evidence
+            let typing_weight = 2.0;  // Typing provides residue type information
+            let seq_weight = 2.0;    // Sequential links connect groups
             let _has_links = has_incoming_links || has_outgoing_links;
 
             for pos in 0..domain_size {
@@ -2444,13 +2446,100 @@ fn extract_group_assignments(
     results
 }
 
+/// Compute Bayesian likelihood ratio for a sequential link.
+///
+/// For each atom observed in BOTH groups:
+/// - Match (diff < tolerance): LR contribution = 19 (strong evidence FOR)
+/// - Mismatch (diff > tolerance): LR contribution = 0.05 (strong evidence AGAINST)
+/// - Missing in one or both: LR contribution = 1 (neutral)
+///
+/// Final LR = product of all contributions. A single mismatch among observed atoms
+/// destroys the link probability (LR drops by ~20x per mismatch).
+fn compute_sequential_link_likelihood_ratio(
+    from_inter: &std::collections::HashMap<String, f64>,
+    to_intra: &std::collections::HashMap<String, f64>,
+    c_tolerance: f64,
+    h_tolerance: f64,
+) -> (f64, Vec<String>, Vec<String>, f64, f64) {
+    // Returns: (likelihood_ratio, matched_atoms, conflicting_atoms, avg_diff, max_diff)
+
+    let mut log_lr = 0.0;
+    let mut matched_atoms = Vec::new();
+    let mut conflicting_atoms = Vec::new();
+    let mut total_diff = 0.0;
+    let mut max_diff = 0.0f64;
+
+    // Log likelihood ratio for match/mismatch
+    // P(match | true_link) ≈ 0.95, P(match | false_link) ≈ 0.05
+    // LR_match = 0.95/0.05 = 19, log(19) ≈ 2.94
+    // LR_mismatch = 0.05/0.95 ≈ 0.053, log(0.053) ≈ -2.94
+    let log_lr_match = (0.95_f64 / 0.05).ln();      // +2.94
+    let log_lr_mismatch = (0.05_f64 / 0.95).ln();  // -2.94
+
+    // Check all backbone atoms that could provide sequential evidence
+    // Carbons: CA, CB, C (carbonyl)
+    // Protons: HA, HB (from HBHACONH)
+    for atom in &["CA", "CB", "C", "HA", "HB", "HA2", "HA3", "HB2", "HB3"] {
+        let atom_str = atom.to_string();
+
+        // Get tolerance based on nucleus type
+        let tol = if atom.starts_with('H') { h_tolerance } else { c_tolerance };
+
+        match (from_inter.get(&atom_str), to_intra.get(&atom_str)) {
+            (Some(&inter), Some(&intra)) => {
+                // Both groups have this atom - compare them
+                let diff = (inter - intra).abs();
+
+                if diff < tol {
+                    // Match: strong evidence FOR the link
+                    log_lr += log_lr_match;
+                    matched_atoms.push(atom_str);
+                    total_diff += diff;
+                    max_diff = max_diff.max(diff);
+                } else {
+                    // Mismatch: strong evidence AGAINST the link
+                    log_lr += log_lr_mismatch;
+                    conflicting_atoms.push(atom_str);
+                }
+            }
+            _ => {
+                // One or both missing: neutral (no information)
+                // LR contribution = 1, log(1) = 0
+            }
+        }
+    }
+
+    let likelihood_ratio = log_lr.exp();
+    let avg_diff = if !matched_atoms.is_empty() {
+        total_diff / matched_atoms.len() as f64
+    } else {
+        0.0
+    };
+
+    (likelihood_ratio, matched_atoms, conflicting_atoms, avg_diff, max_diff)
+}
+
 /// Build sequential links between groups based on inter/intra carbon matching.
-/// Stores shift differences for adaptive tolerance filtering during BP.
+/// Uses Bayesian likelihood ratio scoring - each observed atom provides independent evidence.
+/// A mismatch in ANY observed atom drastically reduces link probability.
 pub fn build_group_sequential_links_with_diffs(
     groups: &[SpinSystemEvidence],
     c_tolerance: f64,
 ) -> Vec<GroupSequentialLink> {
     let mut links = Vec::new();
+
+    // Proton tolerance (tighter than carbon)
+    let h_tolerance = 0.05;
+
+    // Minimum LR to accept a link
+    // LR = 19 means 1 match, 0 conflicts (ln(19) ≈ 2.94)
+    // LR = 361 means 2 matches, 0 conflicts (ln(361) ≈ 5.89)
+    // LR = 6859 means 3 matches, 0 conflicts (ln(6859) ≈ 8.83)
+    // LR = 19 with 1 conflict becomes LR ≈ 1 (useless)
+    //
+    // Accept single-atom matches (LR > 15) but prefer multi-atom (LR > 300)
+    // The key is rejecting links with CONFLICTS, not requiring multiple matches
+    let min_lr = 15.0;
 
     for (from_idx, from_group) in groups.iter().enumerate() {
         // from_group has inter carbons (observed at i-1)
@@ -2463,59 +2552,30 @@ pub fn build_group_sequential_links_with_diffs(
                 continue;
             }
 
-            // to_group has intra carbons (observed at i)
-            // If from's inter matches to's intra, then to follows from
-            let mut matched_atoms = Vec::new();
-            let mut total_strength = 0.0;
-            let mut total_diff = 0.0;
-            let mut max_diff = 0.0f64;
+            // Compute Bayesian likelihood ratio
+            let (lr, matched_atoms, conflicting_atoms, avg_diff, max_diff) =
+                compute_sequential_link_likelihood_ratio(
+                    &from_group.inter_carbons,
+                    &to_group.intra_carbons,
+                    c_tolerance,
+                    h_tolerance,
+                );
 
-            for (atom, &inter_shift) in &from_group.inter_carbons {
-                if let Some(&intra_shift) = to_group.intra_carbons.get(atom) {
-                    let diff = (inter_shift - intra_shift).abs();
-                    if diff < c_tolerance {
-                        matched_atoms.push(atom.clone());
-                        total_diff += diff;
-                        max_diff = max_diff.max(diff);
-                        // Strength based on how close the match is
-                        total_strength += 1.0 - diff / c_tolerance;
-                    }
-                }
+            // Only accept links with sufficient evidence
+            if lr >= min_lr && !matched_atoms.is_empty() {
+                // Use log(LR) as strength for BP (proper Bayesian)
+                let strength = lr.ln();
+
+                links.push(GroupSequentialLink {
+                    from_group: from_idx,
+                    to_group: to_idx,
+                    strength,
+                    matched_atoms,
+                    avg_shift_diff: avg_diff,
+                    max_shift_diff: max_diff,
+                });
             }
-
-            if !matched_atoms.is_empty() {
-                let n_matched = matched_atoms.len() as f64;
-
-                // CRITICAL: Single-atom matches are weak evidence
-                // - Many residues have similar CA or CB individually
-                // - Only BOTH CA+CB matching is strong sequential evidence
-                // - Single matches need to be very tight (<0.3 ppm) to be meaningful
-                let tight_single_tol = 0.3;
-                let should_include = if n_matched >= 2.0 {
-                    // 2+ atoms match: strong evidence
-                    true
-                } else {
-                    // Single atom match: only if very tight
-                    max_diff < tight_single_tol
-                };
-
-                if should_include {
-                    // Strength: heavily reward multiple matches
-                    // Single match at 0.2 ppm: strength ~= 0.33 * 1.0 = 0.33
-                    // Double match at 0.2 ppm: strength ~= 0.66 * 2.0 = 1.32 (4x stronger)
-                    let match_bonus = if n_matched >= 2.0 { n_matched } else { 1.0 };
-                    let agg_strength = total_strength * match_bonus;
-
-                    links.push(GroupSequentialLink {
-                        from_group: from_idx,
-                        to_group: to_idx,
-                        strength: agg_strength,
-                        matched_atoms,
-                        avg_shift_diff: total_diff / n_matched,
-                        max_shift_diff: max_diff,
-                    });
-                }
-            }
+            // Links with conflicts are implicitly rejected (LR < min_lr)
         }
     }
 
@@ -2720,29 +2780,82 @@ struct TripleResSequentialLink {
     from_backbone_idx: usize,
     /// Backbone peak index for position i+1 (the following residue)
     to_backbone_idx: usize,
-    /// Best CA ppm difference (absolute value) - quality computed dynamically from tolerance
-    ca_ppm_diff: f64,
-    /// Best CB ppm difference if available (absolute value)
+    /// CA ppm difference (absolute value) if both observed
+    ca_ppm_diff: Option<f64>,
+    /// CB ppm difference if both observed (absolute value)
     cb_ppm_diff: Option<f64>,
+    /// CO ppm difference if both observed (absolute value)
+    co_ppm_diff: Option<f64>,
+    /// Bayesian log likelihood ratio (pre-computed)
+    log_likelihood_ratio: f64,
 }
 
 impl TripleResSequentialLink {
-    /// Compute quality based on current tolerance (0 = perfect match, 1 = at tolerance limit)
-    /// Returns None if link is outside current tolerance
+    /// Compute quality using Bayesian likelihood ratio.
+    /// Returns None if log_LR is below threshold (link not valid).
     fn quality(&self, c_tolerance: f64) -> Option<f64> {
-        if self.ca_ppm_diff > c_tolerance {
-            return None;  // CA mismatch - link not valid at this tolerance
+        // Require minimum log-LR of 2.7 (LR ≈ 15, roughly one confident match)
+        let min_log_lr = 2.7;
+        if self.log_likelihood_ratio < min_log_lr {
+            return None;
         }
-        let ca_quality = 1.0 - (self.ca_ppm_diff / c_tolerance);
-        let cb_quality = self.cb_ppm_diff.and_then(|diff| {
-            if diff <= c_tolerance {
-                Some(1.0 - (diff / c_tolerance))
+        // Quality scales with log-LR, normalized to [0, 1] range
+        // log-LR of 2.7 → 0.0, log-LR of 8.8 (3 matches) → 1.0
+        let quality = ((self.log_likelihood_ratio - min_log_lr) / 6.0).min(1.0);
+        Some(quality)
+    }
+
+    /// Create a new link with Bayesian scoring.
+    /// Each observed atom contributes evidence: match → +2.94, mismatch → -2.94, missing → 0
+    fn new_with_bayesian_scoring(
+        from_backbone_idx: usize,
+        to_backbone_idx: usize,
+        ca_ppm_diff: Option<f64>,
+        cb_ppm_diff: Option<f64>,
+        co_ppm_diff: Option<f64>,
+        c_tolerance: f64,
+    ) -> Self {
+        let log_lr_match = (0.95_f64 / 0.05).ln();      // +2.94
+        let log_lr_mismatch = (0.05_f64 / 0.95).ln();  // -2.94
+
+        let mut log_lr = 0.0;
+
+        // CA evidence
+        if let Some(diff) = ca_ppm_diff {
+            if diff < c_tolerance {
+                log_lr += log_lr_match;  // Match
             } else {
-                None
+                log_lr += log_lr_mismatch;  // Conflict
             }
-        });
-        // CA quality + 50% bonus for CB match
-        Some(ca_quality + cb_quality.unwrap_or(0.0) * 0.5)
+        }
+        // Missing CA: log_lr += 0 (neutral)
+
+        // CB evidence
+        if let Some(diff) = cb_ppm_diff {
+            if diff < c_tolerance {
+                log_lr += log_lr_match;
+            } else {
+                log_lr += log_lr_mismatch;
+            }
+        }
+
+        // CO evidence
+        if let Some(diff) = co_ppm_diff {
+            if diff < c_tolerance {
+                log_lr += log_lr_match;
+            } else {
+                log_lr += log_lr_mismatch;
+            }
+        }
+
+        Self {
+            from_backbone_idx,
+            to_backbone_idx,
+            ca_ppm_diff,
+            cb_ppm_diff,
+            co_ppm_diff,
+            log_likelihood_ratio: log_lr,
+        }
     }
 }
 
@@ -2826,6 +2939,7 @@ impl UnifiedFactorGraph {
         _hsqc_tocsy_13c_3d: &[UnlabeledPeak],
         // 3D triple-resonance experiments
         hnco: &[UnlabeledPeak],
+        hncaco: &[UnlabeledPeak],
         hnca: &[UnlabeledPeak],
         hncacb: &[UnlabeledPeak],
         cbcaconh: &[UnlabeledPeak],
@@ -3098,8 +3212,26 @@ impl UnifiedFactorGraph {
                         backbone_idx: bb_idx,
                         carbon_shift: co,
                         is_ca: false,  // CO is neither CA nor CB
-                        is_intra: false,  // CO is always from i-1
+                        is_intra: false,  // HNCO CO is always from i-1
                         source: PeakExperimentType::Hnco,
+                    });
+                }
+            }
+        }
+
+        // Process HN(CA)CO: (H, N, CO) - CO(i) strong, CO(i-1) weak
+        // Similar to HNCA - intensity determines intra vs inter
+        for peak in hncaco {
+            if peak.position_ppm.len() >= 3 {
+                let (h, n, co) = (peak.position_ppm[0], peak.position_ppm[1], peak.position_ppm[2]);
+                if let Some(bb_idx) = find_backbone(h, n) {
+                    let is_intra = peak.intensity > 0.5;  // Strong = intra-residue CO(i)
+                    triple_res_carbons.push(TripleResCarbonObs {
+                        backbone_idx: bb_idx,
+                        carbon_shift: co,
+                        is_ca: false,  // CO is neither CA nor CB
+                        is_intra,
+                        source: PeakExperimentType::Hncaco,
                     });
                 }
             }
@@ -3123,17 +3255,15 @@ impl UnifiedFactorGraph {
             }
         }
 
-        // Process HNCACB: (H, N, CA/CB) - sign encodes intra(+) vs inter(-)
-        // Positive intensity = intra-residue, negative = inter-residue
-        // CA typically 50-65 ppm, CB typically 15-45 ppm (except THR/SER ~60-70)
+        // Process HNCACB: (H, N, CA/CB)
+        // SIGN determines CA vs CB: positive = CA, negative = CB (CB is inverted)
+        // MAGNITUDE determines intra vs inter: |intensity| > 0.5 = intra (i), <= 0.5 = inter (i-1)
         for peak in hncacb {
             if peak.position_ppm.len() >= 3 {
                 let (h, n, c) = (peak.position_ppm[0], peak.position_ppm[1], peak.position_ppm[2]);
                 if let Some(bb_idx) = find_backbone(h, n) {
-                    let is_intra = peak.intensity > 0.0;  // Sign convention
-                    // CA is typically 50-65 ppm, CB is typically 15-45 ppm
-                    // Exception: THR/SER CB ~60-70 ppm, but we'll use shift threshold
-                    let is_ca = c > 45.0;  // Simple heuristic
+                    let is_ca = peak.intensity > 0.0;  // Sign determines CA/CB
+                    let is_intra = peak.intensity.abs() > 0.5;  // Magnitude determines intra/inter
                     triple_res_carbons.push(TripleResCarbonObs {
                         backbone_idx: bb_idx,
                         carbon_shift: c,
@@ -3146,11 +3276,12 @@ impl UnifiedFactorGraph {
         }
 
         // Process CBCACONH: (H, N, CA/CB) - i-1 only
+        // Use sign encoding consistent with HNCACB: positive = CA, negative = CB
         for peak in cbcaconh {
             if peak.position_ppm.len() >= 3 {
                 let (h, n, c) = (peak.position_ppm[0], peak.position_ppm[1], peak.position_ppm[2]);
                 if let Some(bb_idx) = find_backbone(h, n) {
-                    let is_ca = c > 45.0;
+                    let is_ca = peak.intensity > 0.0;  // Sign determines CA/CB (consistent with HNCACB)
                     triple_res_carbons.push(TripleResCarbonObs {
                         backbone_idx: bb_idx,
                         carbon_shift: c,
@@ -3166,25 +3297,37 @@ impl UnifiedFactorGraph {
         // Currently not used for BP but stored for potential future enhancement
         let _hbhaconh_count = hbhaconh.len();  // Acknowledge but don't store
 
-        // === Build sequential links from CA/CB matching ===
-        // For each backbone peak, collect its intra-residue CA(i) and inter-residue CA(i-1)
-        // Then match: if backbone A has CA(i) that matches backbone B's CA(i-1), A precedes B
+        // === Build sequential links from CA/CB/CO matching with Bayesian LR scoring ===
+        // For each backbone peak, collect its intra-residue atoms and inter-residue atoms
+        // Then match: if backbone A has intra-atoms that match backbone B's inter-atoms, A precedes B
+        // Bayesian scoring: each matching atom is +2.94 log-LR, each conflicting atom is -2.94 log-LR
         let mut triple_res_sequential: Vec<TripleResSequentialLink> = Vec::new();
 
-        // Group carbon observations by backbone index
+        // Group carbon observations by backbone index and atom type
         let mut intra_ca_by_bb: HashMap<usize, Vec<f64>> = HashMap::new();
         let mut inter_ca_by_bb: HashMap<usize, Vec<f64>> = HashMap::new();
         let mut intra_cb_by_bb: HashMap<usize, Vec<f64>> = HashMap::new();
         let mut inter_cb_by_bb: HashMap<usize, Vec<f64>> = HashMap::new();
+        let mut intra_co_by_bb: HashMap<usize, Vec<f64>> = HashMap::new();
+        let mut inter_co_by_bb: HashMap<usize, Vec<f64>> = HashMap::new();
 
         for obs in &triple_res_carbons {
             if obs.is_ca {
+                // CA from HNCA/HNCACB
                 if obs.is_intra {
                     intra_ca_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
                 } else {
                     inter_ca_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
                 }
-            } else if obs.source != PeakExperimentType::Hnco {  // Exclude CO
+            } else if obs.source == PeakExperimentType::Hnco || obs.source == PeakExperimentType::Hncaco {
+                // CO from HNCO/HNCACO
+                if obs.is_intra {
+                    intra_co_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
+                } else {
+                    inter_co_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
+                }
+            } else {
+                // CB from HNCACB/CBCACONH
                 if obs.is_intra {
                     intra_cb_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
                 } else {
@@ -3193,56 +3336,65 @@ impl UnifiedFactorGraph {
             }
         }
 
-        // Find sequential matches: CA(i) at backbone A matches CA(i-1) at backbone B
-        // Store raw ppm differences - quality computed dynamically based on current tolerance
-        // Use a HashMap to deduplicate and keep only the best (smallest diff) link per (from, to) pair
-        let mut best_links: HashMap<(usize, usize), TripleResSequentialLink> = HashMap::new();
-
-        for (&bb_a, ca_intra_shifts) in &intra_ca_by_bb {
-            for (&bb_b, ca_inter_shifts) in &inter_ca_by_bb {
-                if bb_a == bb_b { continue; }  // Can't be sequential with itself
-
-                // Find the smallest CA difference between A's intra and B's inter
-                let mut best_ca_diff = f64::MAX;
-                for &ca_a in ca_intra_shifts {
-                    for &ca_b in ca_inter_shifts {
-                        let ca_diff = (ca_a - ca_b).abs();
-                        if ca_diff < carbon_match_tolerance {
-                            best_ca_diff = best_ca_diff.min(ca_diff);
+        // Helper to find best (smallest) match between two atom lists, returning None if both have values but no match
+        let find_best_match = |intra_list: Option<&Vec<f64>>, inter_list: Option<&Vec<f64>>, tol: f64| -> Option<f64> {
+            match (intra_list, inter_list) {
+                (Some(intra), Some(inter)) if !intra.is_empty() && !inter.is_empty() => {
+                    let mut best = f64::MAX;
+                    for &a in intra {
+                        for &b in inter {
+                            best = best.min((a - b).abs());
                         }
                     }
+                    Some(best)  // Returns the difference, even if > tol (for conflict detection)
+                }
+                _ => None,  // Missing data = neutral
+            }
+        };
+
+        // Build all backbone pairs, score with Bayesian LR
+        let backbone_count = peaks.iter().filter(|p| p.peak_type == PeakType::Backbone).count();
+        let mut best_links: HashMap<(usize, usize), TripleResSequentialLink> = HashMap::new();
+
+        for bb_a in 0..backbone_count {
+            for bb_b in 0..backbone_count {
+                if bb_a == bb_b { continue; }
+
+                // Get differences for each atom type (if both observed)
+                let ca_diff = find_best_match(
+                    intra_ca_by_bb.get(&bb_a),
+                    inter_ca_by_bb.get(&bb_b),
+                    carbon_match_tolerance
+                );
+                let cb_diff = find_best_match(
+                    intra_cb_by_bb.get(&bb_a),
+                    inter_cb_by_bb.get(&bb_b),
+                    carbon_match_tolerance
+                );
+                let co_diff = find_best_match(
+                    intra_co_by_bb.get(&bb_a),
+                    inter_co_by_bb.get(&bb_b),
+                    carbon_match_tolerance
+                );
+
+                // Skip if no atoms to compare
+                if ca_diff.is_none() && cb_diff.is_none() && co_diff.is_none() {
+                    continue;
                 }
 
-                if best_ca_diff < f64::MAX {
-                    // Find smallest CB difference as additional evidence
-                    let best_cb_diff = intra_cb_by_bb.get(&bb_a)
-                        .and_then(|cb_intra| {
-                            inter_cb_by_bb.get(&bb_b).and_then(|cb_inter| {
-                                let mut min_cb = f64::MAX;
-                                for &cb_a in cb_intra {
-                                    for &cb_b in cb_inter {
-                                        let cb_diff = (cb_a - cb_b).abs();
-                                        if cb_diff < carbon_match_tolerance {
-                                            min_cb = min_cb.min(cb_diff);
-                                        }
-                                    }
-                                }
-                                if min_cb < f64::MAX { Some(min_cb) } else { None }
-                            })
-                        });
+                // Create link with Bayesian LR scoring
+                let link = TripleResSequentialLink::new_with_bayesian_scoring(
+                    bb_a, bb_b,
+                    ca_diff, cb_diff, co_diff,
+                    carbon_match_tolerance,
+                );
 
-                    let link = TripleResSequentialLink {
-                        from_backbone_idx: bb_a,
-                        to_backbone_idx: bb_b,
-                        ca_ppm_diff: best_ca_diff,
-                        cb_ppm_diff: best_cb_diff,
-                    };
-
-                    // Keep the link with smallest CA diff for this (from, to) pair
+                // Only keep links with positive log-LR (at least one match, no conflicts)
+                if link.log_likelihood_ratio > 0.0 {
                     let key = (bb_a, bb_b);
                     if let Some(existing) = best_links.get(&key) {
-                        // Smaller ppm diff = better match
-                        if best_ca_diff < existing.ca_ppm_diff {
+                        // Keep link with higher log-LR
+                        if link.log_likelihood_ratio > existing.log_likelihood_ratio {
                             best_links.insert(key, link);
                         }
                     } else {
@@ -3255,27 +3407,60 @@ impl UnifiedFactorGraph {
         let triple_res_sequential: Vec<TripleResSequentialLink> = best_links.into_values().collect();
 
         if params.verbose && (!triple_res_carbons.is_empty() || !triple_res_sequential.is_empty()) {
-            println!("\n--- 3D TRIPLE-RESONANCE DATA ---");
+            println!("\n--- 3D TRIPLE-RESONANCE DATA (Bayesian LR scoring) ---");
             println!("  Carbon observations linked to backbone: {}", triple_res_carbons.len());
-            println!("  Initial tolerances: H/N={:.3} ppm, CA/CB={:.2} ppm",
+            println!("  Initial tolerances: H/N={:.3} ppm, CA/CB/CO={:.2} ppm",
                 hn_tolerance, carbon_match_tolerance);
-            // Show intra and inter CA shifts for each backbone
-            println!("\n  CA shifts by backbone (for sequential matching):");
+
+            // Count observations by type
+            let ca_count = triple_res_carbons.iter().filter(|o| o.is_ca).count();
+            let cb_count = triple_res_carbons.iter().filter(|o| !o.is_ca && o.source != PeakExperimentType::Hnco && o.source != PeakExperimentType::Hncaco).count();
+            let co_count = triple_res_carbons.iter().filter(|o| o.source == PeakExperimentType::Hnco || o.source == PeakExperimentType::Hncaco).count();
+            println!("  Atom types: CA={}, CB={}, CO={}", ca_count, cb_count, co_count);
+
+            // Show intra and inter atoms for each backbone
+            println!("\n  Carbon shifts by backbone (for sequential matching):");
             for bb_idx in 0..peaks.iter().filter(|p| p.peak_type == PeakType::Backbone).count() {
                 let intra_cas: Vec<f64> = intra_ca_by_bb.get(&bb_idx).map_or(vec![], |v| v.clone());
                 let inter_cas: Vec<f64> = inter_ca_by_bb.get(&bb_idx).map_or(vec![], |v| v.clone());
-                if !intra_cas.is_empty() || !inter_cas.is_empty() {
-                    println!("    BB {}: intra CA(i)={:?}, inter CA(i-1)={:?}",
-                        bb_idx,
-                        intra_cas.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>(),
-                        inter_cas.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>());
+                let intra_cbs: Vec<f64> = intra_cb_by_bb.get(&bb_idx).map_or(vec![], |v| v.clone());
+                let inter_cbs: Vec<f64> = inter_cb_by_bb.get(&bb_idx).map_or(vec![], |v| v.clone());
+                let intra_cos: Vec<f64> = intra_co_by_bb.get(&bb_idx).map_or(vec![], |v| v.clone());
+                let inter_cos: Vec<f64> = inter_co_by_bb.get(&bb_idx).map_or(vec![], |v| v.clone());
+
+                if !intra_cas.is_empty() || !inter_cas.is_empty() || !intra_cbs.is_empty() || !inter_cbs.is_empty() || !intra_cos.is_empty() || !inter_cos.is_empty() {
+                    println!("    BB {}:", bb_idx);
+                    if !intra_cas.is_empty() || !inter_cas.is_empty() {
+                        println!("      CA: intra={:?}, inter={:?}",
+                            intra_cas.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>(),
+                            inter_cas.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>());
+                    }
+                    if !intra_cbs.is_empty() || !inter_cbs.is_empty() {
+                        println!("      CB: intra={:?}, inter={:?}",
+                            intra_cbs.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>(),
+                            inter_cbs.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>());
+                    }
+                    if !intra_cos.is_empty() || !inter_cos.is_empty() {
+                        println!("      CO: intra={:?}, inter={:?}",
+                            intra_cos.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>(),
+                            inter_cos.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>());
+                    }
                 }
             }
-            println!("\n  Sequential links from CA/CB matching (ppm diffs): {}", triple_res_sequential.len());
-            for link in &triple_res_sequential {
-                let cb_str = link.cb_ppm_diff.map_or("none".to_string(), |d| format!("{:.3}", d));
-                println!("    BB {} → BB {} (CA Δppm={:.3}, CB Δppm={})",
-                    link.from_backbone_idx, link.to_backbone_idx, link.ca_ppm_diff, cb_str);
+
+            println!("\n  Sequential links (Bayesian LR): {} links", triple_res_sequential.len());
+            // Sort by log-LR for better display
+            let mut sorted_links: Vec<_> = triple_res_sequential.iter().collect();
+            sorted_links.sort_by(|a, b| b.log_likelihood_ratio.partial_cmp(&a.log_likelihood_ratio).unwrap_or(std::cmp::Ordering::Equal));
+            for link in sorted_links.iter().take(20) {  // Show top 20
+                let ca_str = link.ca_ppm_diff.map_or("-".to_string(), |d| format!("{:.3}", d));
+                let cb_str = link.cb_ppm_diff.map_or("-".to_string(), |d| format!("{:.3}", d));
+                let co_str = link.co_ppm_diff.map_or("-".to_string(), |d| format!("{:.3}", d));
+                println!("    BB {} → BB {} (log-LR={:.2}, CA={}, CB={}, CO={})",
+                    link.from_backbone_idx, link.to_backbone_idx, link.log_likelihood_ratio, ca_str, cb_str, co_str);
+            }
+            if triple_res_sequential.len() > 20 {
+                println!("    ... and {} more links", triple_res_sequential.len() - 20);
             }
         }
 
@@ -6685,7 +6870,7 @@ fn update_observation_beliefs(
 /// Sequential link between two observations indicating they are from adjacent residues.
 /// If obs_from is at position P, then obs_to should be at position P+1.
 #[derive(Debug, Clone)]
-struct SequentialLink {
+struct ObsSequentialLink {
     from_idx: usize,  // Observation index that is at position i
     to_idx: usize,    // Observation index that is at position i+1
     strength: f64,    // Carbon match quality (0-1)
@@ -6693,182 +6878,197 @@ struct SequentialLink {
 
 /// Compute sequential links from backbone-sequential transfer pathway observations.
 ///
-/// Physics-based approach: uses TransferPathway and ResidueOffset instead of experiment types.
+/// Uses Bayesian likelihood ratio scoring with multi-atom evidence aggregation:
+/// - Groups observations by backbone (H, N) anchor
+/// - Collects all intra/inter CA, CB, CO shifts per backbone group
+/// - For each backbone pair, computes Bayesian LR: match = +2.94, conflict = -2.94, missing = 0
+/// - Only creates links with positive log-LR (at least one match, no conflicts)
 ///
-/// Observations with BackboneSequential transfer pathway show carbon correlations to backbone NH.
-/// The carbon dimension has a ResidueOffset indicating whether it observes the anchor residue (Intra)
-/// or the preceding residue (PrecedingResidue).
-///
-/// When carbon shifts match across different backbone anchors:
-/// - Intra@backbone_A + PrecedingResidue@backbone_B → both see same residue → same-residue link
-/// - PrecedingResidue@backbone_A + Intra@backbone_B → both see same residue → same-residue link
-/// - Both Intra or both PrecedingResidue → different residues → no link
+/// This dramatically reduces false positives: if CA matches but CB conflicts, the link is rejected.
 fn compute_sequential_links(
     observations: &[Observation],
     tol_params: &NucleusToleranceParams,
     iteration: usize,
     max_iterations: usize,
-) -> Vec<SequentialLink> {
+) -> Vec<ObsSequentialLink> {
     use crate::data::spin_system::{TransferPathway, ResidueOffset};
+    use std::collections::HashMap;
 
-    // Use VERY TIGHT carbon tolerance for sequential links to avoid false matches
-    // With perfect BMRB data, true intra/inter pairs should match exactly (0.0 ppm diff)
-    // Using 0.05 ppm to handle only numerical precision issues
-    // This prevents false sequential links from residues with similar carbon shifts
-    let c_tol = 0.05;  // Very tight tolerance - only matches near-exact shifts
+    let c_tol = 0.3;  // Carbon tolerance for matching
     let h_tol = tol_params.tolerance_for(NucleusType::H1, iteration, max_iterations);
     let n_tol = tol_params.tolerance_for(NucleusType::N15, iteration, max_iterations);
 
-    let mut links = Vec::new();
-
-    // Helper to get backbone anchor (H, N) shifts
-    fn get_backbone(obs: &Observation) -> Option<(f64, f64)> {
-        let h = obs.dimensions.iter()
-            .find(|d| d.nucleus == NucleusType::H1)
-            .map(|d| d.shift)?;
-        let n = obs.dimensions.iter()
-            .find(|d| d.nucleus == NucleusType::N15)
-            .map(|d| d.shift)?;
-        Some((h, n))
+    // === Step 1: Group observations by backbone (H, N) anchor ===
+    // Key: (H*1000, N*10) as integers for grouping
+    #[derive(Debug)]
+    struct BackboneGroup {
+        h: f64,
+        n: f64,
+        obs_indices: Vec<usize>,  // Observation indices in this group
+        intra_ca: Vec<f64>,
+        inter_ca: Vec<f64>,
+        intra_cb: Vec<f64>,
+        inter_cb: Vec<f64>,
+        intra_co: Vec<f64>,
+        inter_co: Vec<f64>,
     }
 
-    // Helper to get carbon shift, residue offset, AND atom type (physics-based!)
-    // We need to distinguish CA from CB to avoid false matches
-    fn get_carbon_with_offset(obs: &Observation) -> Option<(f64, ResidueOffset, String)> {
-        obs.dimensions.iter()
-            .find(|d| d.nucleus == NucleusType::C13)
-            .map(|d| {
-                // Get atom hint or infer from shift range
-                let atom_type = d.atom_hint.clone().unwrap_or_else(|| {
-                    // Infer CA vs CB from shift range
-                    if d.shift > 44.0 && d.shift < 66.0 {
-                        "CA".to_string()
-                    } else if d.shift < 44.0 || d.shift > 66.0 {
-                        "CB".to_string()
-                    } else {
-                        "C".to_string()  // Unknown
-                    }
-                });
-                (d.shift, d.residue_offset, atom_type)
-            })
-    }
+    let mut groups: Vec<BackboneGroup> = Vec::new();
 
-    // Helper to check if two backbones are different (not the same NH)
-    let different_backbone = |h1: f64, n1: f64, h2: f64, n2: f64| -> bool {
-        (h1 - h2).abs() > h_tol || (n1 - n2).abs() > n_tol
+    // Helper to find or create backbone group
+    let find_or_create_group = |groups: &mut Vec<BackboneGroup>, h: f64, n: f64, h_tol: f64, n_tol: f64| -> usize {
+        for (idx, g) in groups.iter().enumerate() {
+            if (g.h - h).abs() < h_tol && (g.n - n).abs() < n_tol {
+                return idx;
+            }
+        }
+        groups.push(BackboneGroup {
+            h, n,
+            obs_indices: Vec::new(),
+            intra_ca: Vec::new(), inter_ca: Vec::new(),
+            intra_cb: Vec::new(), inter_cb: Vec::new(),
+            intra_co: Vec::new(), inter_co: Vec::new(),
+        });
+        groups.len() - 1
     };
 
-    // Find all backbone-sequential observations (HNCA, HNCACB, CBCACONH, etc.)
-    // Physics-based: filter by transfer pathway, NOT experiment type!
-    let sequential_obs: Vec<(usize, &Observation)> = observations.iter()
-        .enumerate()
-        .filter(|(_, obs)| obs.transfer_pathway == TransferPathway::BackboneSequential)
-        .collect();
+    // Process all backbone-sequential observations
+    for (obs_idx, obs) in observations.iter().enumerate() {
+        if obs.transfer_pathway != TransferPathway::BackboneSequential {
+            continue;
+        }
 
-    // For each pair of backbone-sequential observations at DIFFERENT backbones
-    for (i, (idx_a, obs_a)) in sequential_obs.iter().enumerate() {
-        let Some((h_a, n_a)) = get_backbone(obs_a) else { continue };
-        let Some((c_a, offset_a, atom_a)) = get_carbon_with_offset(obs_a) else { continue };
+        // Get backbone anchor
+        let h = obs.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift);
+        let n = obs.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift);
+        let (Some(h), Some(n)) = (h, n) else { continue };
 
-        for (idx_b, obs_b) in sequential_obs.iter().skip(i + 1) {
-            let Some((h_b, n_b)) = get_backbone(obs_b) else { continue };
-            let Some((c_b, offset_b, atom_b)) = get_carbon_with_offset(obs_b) else { continue };
+        // Get carbon info
+        let c_dim = obs.dimensions.iter().find(|d| d.nucleus == NucleusType::C13);
+        let Some(c_dim) = c_dim else { continue };
 
-            // Skip if same backbone anchor
-            if !different_backbone(h_a, n_a, h_b, n_b) {
+        let c_shift = c_dim.shift;
+        let is_intra = c_dim.residue_offset == ResidueOffset::Intra;
+
+        // Determine atom type from hint or shift range
+        let atom_type = c_dim.atom_hint.clone().unwrap_or_else(|| {
+            if c_shift > 165.0 && c_shift < 185.0 {
+                "C".to_string()  // CO
+            } else if c_shift > 44.0 && c_shift < 75.0 {
+                "CA".to_string()
+            } else {
+                "CB".to_string()
+            }
+        });
+
+        // Find or create group
+        let group_idx = find_or_create_group(&mut groups, h, n, h_tol, n_tol);
+        let group = &mut groups[group_idx];
+        group.obs_indices.push(obs_idx);
+
+        // Add carbon to appropriate list
+        match (atom_type.as_str(), is_intra) {
+            ("CA", true) => group.intra_ca.push(c_shift),
+            ("CA", false) => group.inter_ca.push(c_shift),
+            ("CB", true) => group.intra_cb.push(c_shift),
+            ("CB", false) => group.inter_cb.push(c_shift),
+            ("C", true) => group.intra_co.push(c_shift),
+            ("C", false) => group.inter_co.push(c_shift),
+            _ => {}
+        }
+    }
+
+    // === Step 2: Build sequential links between backbone groups with Bayesian LR ===
+    let mut links = Vec::new();
+    let log_lr_match = (0.95_f64 / 0.05).ln();      // +2.94
+    let log_lr_mismatch = (0.05_f64 / 0.95).ln();  // -2.94
+
+    // Helper to find best match between two shift lists
+    let find_best_diff = |intra: &[f64], inter: &[f64]| -> Option<f64> {
+        if intra.is_empty() || inter.is_empty() {
+            return None;  // Missing data
+        }
+        let mut best = f64::MAX;
+        for &a in intra {
+            for &b in inter {
+                best = best.min((a - b).abs());
+            }
+        }
+        Some(best)
+    };
+
+    // For each pair of backbone groups
+    for (from_idx, from_group) in groups.iter().enumerate() {
+        for (to_idx, to_group) in groups.iter().enumerate() {
+            if from_idx == to_idx { continue; }
+
+            // Check: from_group's INTRA matches to_group's INTER
+            // This means from_group precedes to_group in sequence
+
+            let ca_diff = find_best_diff(&from_group.intra_ca, &to_group.inter_ca);
+            let cb_diff = find_best_diff(&from_group.intra_cb, &to_group.inter_cb);
+            let co_diff = find_best_diff(&from_group.intra_co, &to_group.inter_co);
+
+            // Skip if no atoms to compare
+            if ca_diff.is_none() && cb_diff.is_none() && co_diff.is_none() {
                 continue;
             }
 
-            // CRITICAL: Only match same atom types!
-            // CA must match CA, CB must match CB
-            // This prevents false sequential links from coincidental shift matches
-            if atom_a != atom_b {
-                continue;  // Different atom types cannot be sequential matches
+            // Compute Bayesian log-LR
+            let mut log_lr = 0.0;
+            let mut matched_atoms = Vec::new();
+            let mut conflicting_atoms = Vec::new();
+
+            if let Some(diff) = ca_diff {
+                if diff < c_tol {
+                    log_lr += log_lr_match;
+                    matched_atoms.push("CA");
+                } else {
+                    log_lr += log_lr_mismatch;
+                    conflicting_atoms.push("CA");
+                }
             }
 
-            // Check for carbon shift match
-            let c_diff = (c_a - c_b).abs();
-            if c_diff >= c_tol {
-                continue;  // No carbon match
+            if let Some(diff) = cb_diff {
+                if diff < c_tol {
+                    log_lr += log_lr_match;
+                    matched_atoms.push("CB");
+                } else {
+                    log_lr += log_lr_mismatch;
+                    conflicting_atoms.push("CB");
+                }
             }
 
-            // Carbon match found at DIFFERENT backbones!
-            // Use physics-based residue_offset instead of experiment-type dispatch:
-            //   - Intra@backbone_X sees residue at position_X
-            //   - PrecedingResidue@backbone_Y sees residue at position_Y - 1
-            // If carbons match: the residues they observe are the SAME
-            //   - If A Intra@X and B PrecedingResidue@Y match: position_X = position_Y - 1
-            //     → backbone B is at position_X + 1 (B follows A)
-            //   - If A PrecedingResidue@X and B Intra@Y match: position_X - 1 = position_Y
-            //     → backbone A is at position_Y + 1 (A follows B)
-            //
-            // These are SEQUENTIAL BACKBONE ORDERING links:
-            // - POSITIVE strength means from_idx precedes to_idx in sequence
-
-            let match_strength = (-0.5 * (c_diff / c_tol).powi(2)).exp();
-
-            let is_intra_a = offset_a == ResidueOffset::Intra;
-            let is_intra_b = offset_b == ResidueOffset::Intra;
-
-            if is_intra_a && !is_intra_b {
-                // A shows Intra (residue at position A), B shows PrecedingResidue (residue at position B-1)
-                // Match means: position_A = position_B - 1
-                // Therefore: B follows A in sequence (A → A+1 = B)
-                links.push(SequentialLink {
-                    from_idx: *idx_a,
-                    to_idx: *idx_b,
-                    strength: match_strength,  // POSITIVE = B follows A
-                });
-            } else if !is_intra_a && is_intra_b {
-                // A shows PrecedingResidue (residue at position A-1), B shows Intra (residue at position B)
-                // Match means: position_A - 1 = position_B
-                // Therefore: A follows B in sequence (B → B+1 = A)
-                links.push(SequentialLink {
-                    from_idx: *idx_b,  // B is the predecessor
-                    to_idx: *idx_a,    // A is the successor
-                    strength: match_strength,  // POSITIVE = A follows B
-                });
+            if let Some(diff) = co_diff {
+                if diff < c_tol {
+                    log_lr += log_lr_match;
+                    matched_atoms.push("C");
+                } else {
+                    log_lr += log_lr_mismatch;
+                    conflicting_atoms.push("C");
+                }
             }
-            // Both Intra or both PrecedingResidue: they observe different residues at same backbone
-            // This gives same-residue grouping (negative strength) for SAME backbone
-            else if is_intra_a && is_intra_b {
-                // Both see their own backbone's residue - but at DIFFERENT backbones
-                // If carbons match, these might be the same residue type at different positions
-                // This is weaker evidence - downweight it
-                // Actually skip - different backbones seeing different intra carbons that happen to match
-                // is coincidental (same residue TYPE, not same residue POSITION)
+
+            // Only create link if log-LR > 0 (more evidence FOR than AGAINST)
+            if log_lr > 0.0 && !matched_atoms.is_empty() {
+                // Create link from any observation in from_group to any in to_group
+                // Use first observation from each group as representative
+                if let (Some(&from_obs), Some(&to_obs)) = (from_group.obs_indices.first(), to_group.obs_indices.first()) {
+                    // Strength based on log-LR, normalized
+                    let strength = (log_lr / 8.83).min(1.0);  // Max log-LR for 3 matches ≈ 8.83
+
+                    links.push(ObsSequentialLink {
+                        from_idx: from_obs,
+                        to_idx: to_obs,
+                        strength,
+                    });
+                }
             }
         }
     }
 
-    // Debug: count links by atom type
-    let mut atom_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for link in &links {
-        let obs_a = &observations[link.from_idx];
-        let obs_b = &observations[link.to_idx];
-        let atom_a = obs_a.dimensions.iter()
-            .find(|d| d.nucleus == NucleusType::C13)
-            .and_then(|d| d.atom_hint.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        *atom_type_counts.entry(atom_a).or_insert(0) += 1;
-    }
-    println!("Sequential links by atom type: {:?}", atom_type_counts);
-
-    // Debug: print sample sequential links (first 10 only to avoid spam)
-    if links.len() > 0 && false {  // Disabled by default
-        println!("Sample sequential links ({} total):", links.len());
-        for link in links.iter().take(10) {
-            let obs_a = &observations[link.from_idx];
-            let obs_b = &observations[link.to_idx];
-            let h_a = obs_a.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift).unwrap_or(0.0);
-            let n_a = obs_a.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift).unwrap_or(0.0);
-            let h_b = obs_b.dimensions.iter().find(|d| d.nucleus == NucleusType::H1).map(|d| d.shift).unwrap_or(0.0);
-            let n_b = obs_b.dimensions.iter().find(|d| d.nucleus == NucleusType::N15).map(|d| d.shift).unwrap_or(0.0);
-            let atom = obs_a.dimensions.iter().find(|d| d.nucleus == NucleusType::C13).and_then(|d| d.atom_hint.clone()).unwrap_or("?".to_string());
-            println!("  ({:.2}, {:.1}) -> ({:.2}, {:.1}) [{}] str={:.3}",
-                h_a, n_a, h_b, n_b, atom, link.strength);
-        }
-    }
+    // Debug output
+    println!("Backbone groups: {}, Sequential links (Bayesian LR): {}", groups.len(), links.len());
 
     links
 }
@@ -6983,7 +7183,7 @@ fn update_observation_beliefs_with_sequential(
     beliefs: &[Vec<f64>],
     typing_scores: &[Vec<f64>],
     correlation_scores: &[Vec<f64>],
-    sequential_links: &[SequentialLink],
+    sequential_links: &[ObsSequentialLink],
     noesy_links: &[(usize, usize, f64)],  // (backbone_idx, carbon_idx, quality)
     type_to_positions: &HashMap<String, Vec<usize>>,
     residue_types: &[String],
@@ -7368,6 +7568,7 @@ pub fn run_unified_assignment(
     hsqc_tocsy_13c_3d: &[UnlabeledPeak],
     // 3D triple-resonance experiments
     hnco: &[UnlabeledPeak],
+    hncaco: &[UnlabeledPeak],
     hnca: &[UnlabeledPeak],
     hncacb: &[UnlabeledPeak],
     cbcaconh: &[UnlabeledPeak],
@@ -7378,7 +7579,7 @@ pub fn run_unified_assignment(
     let mut graph = UnifiedFactorGraph::new(
         hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c,
         hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d,
-        hnco, hnca, hncacb, cbcaconh, hbhaconh,
+        hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh,
         sequence, params
     );
 
@@ -7444,6 +7645,7 @@ mod tests {
 
         // 3D triple-resonance (empty for this test)
         let hnco: Vec<UnlabeledPeak> = vec![];
+        let hncaco: Vec<UnlabeledPeak> = vec![];
         let hnca: Vec<UnlabeledPeak> = vec![];
         let hncacb: Vec<UnlabeledPeak> = vec![];
         let cbcaconh: Vec<UnlabeledPeak> = vec![];
@@ -7454,7 +7656,7 @@ mod tests {
             &hsqc_15n, &hsqc_13c, &tocsy, &noesy,
             &hsqc_tocsy_15n, &hsqc_tocsy_13c,
             &hsqc_tocsy_15n_3d, &hsqc_tocsy_13c_3d,
-            &hnco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
+            &hnco, &hncaco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
             sequence, &params
         );
 

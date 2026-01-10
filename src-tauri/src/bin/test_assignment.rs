@@ -1445,9 +1445,11 @@ fn generate_peaks_from_bmrb(
             }
         }
 
-        // HNCACB: (H, N, C) - positive for intra (i), negative for inter (i-1)
+        // HNCACB: Sign = CA/CB (CA positive, CB negative), Magnitude = intra/inter
+        // CA peaks are positive, CB peaks are negative (inverted)
+        // Strong magnitude = intra (i), weak magnitude = inter (i-1)
         if filter.should_include("hncacb") {
-            // Intra-residue CA(i) - positive
+            // Intra-residue CA(i) - positive, strong
             if let Some(ca) = ca_curr {
                 let peak = UnlabeledPeak::hncacb(h_val, n_val, ca, 1.0);
                 let reference = vec![
@@ -1458,30 +1460,30 @@ fn generate_peaks_from_bmrb(
                 ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i)+", reference);
                 hncacb.push(peak);
             }
-            // Intra-residue CB(i) - positive
+            // Intra-residue CB(i) - NEGATIVE (CB is inverted), strong
             if let Some(cb) = cb_curr {
-                let peak = UnlabeledPeak::hncacb(h_val, n_val, cb, 0.8);
+                let peak = UnlabeledPeak::hncacb(h_val, n_val, cb, -0.8);
                 let reference = vec![
                     ("H".to_string(), h_val),
                     ("N".to_string(), n_val),
                     ("CB".to_string(), cb),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CB(i)+", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CB(i)-", reference);
                 hncacb.push(peak);
             }
-            // Inter-residue CA(i-1) - negative
+            // Inter-residue CA(i-1) - POSITIVE (CA is positive), weak
             // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for CA
             if let Some(ca) = ca_prev {
-                let peak = UnlabeledPeak::hncacb(h_val, n_val, ca, -0.3);
+                let peak = UnlabeledPeak::hncacb(h_val, n_val, ca, 0.3);
                 let reference = vec![
                     ("H".to_string(), h_val),
                     ("N".to_string(), n_val),
                     ("CA".to_string(), ca),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)-", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)+", reference);
                 hncacb.push(peak);
             }
-            // Inter-residue CB(i-1) - negative
+            // Inter-residue CB(i-1) - negative, weak
             if let Some(cb) = cb_prev {
                 let peak = UnlabeledPeak::hncacb(h_val, n_val, cb, -0.25);
                 let reference = vec![
@@ -1495,15 +1497,16 @@ fn generate_peaks_from_bmrb(
         }
 
         // CBCACONH: (H, N, CA/CB) - only i-1 carbons
+        // Use sign encoding consistent with HNCACB: CA positive, CB negative
         // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for carbons
         if filter.should_include("cbcaconh") {
             if let Some(ca) = ca_prev {
-                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, ca, 1.0);
+                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, ca, 1.0);  // CA positive
                 ground_truth.register(&peak, curr_seq, "H/N/CA(i-1)");
                 cbcaconh.push(peak);
             }
             if let Some(cb) = cb_prev {
-                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, cb, 0.8);
+                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, cb, -0.8);  // CB negative (consistent with HNCACB)
                 ground_truth.register(&peak, curr_seq, "H/N/CB(i-1)");
                 cbcaconh.push(peak);
             }
@@ -2074,9 +2077,11 @@ fn generate_synthetic_peaks(
             }
         }
 
-        // HNCACB: (H, N, C) - positive for intra (i), negative for inter (i-1)
+        // HNCACB: Sign = CA/CB (CA positive, CB negative), Magnitude = intra/inter
+        // CA peaks are positive, CB peaks are negative (inverted)
+        // Strong magnitude = intra (i), weak magnitude = inter (i-1)
         if filter.should_include("hncacb") {
-            // Intra-residue CA(i) - positive
+            // Intra-residue CA(i) - positive, strong
             if let (Some(ca), Some(h_r), Some(n_r), Some(ca_r)) =
                 (ca_curr, h_ref_val, n_ref_val, ca_curr_ref)
             {
@@ -2089,34 +2094,34 @@ fn generate_synthetic_peaks(
                 ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i)+", reference);
                 hncacb.push(peak);
             }
-            // Intra-residue CB(i) - positive
+            // Intra-residue CB(i) - NEGATIVE (CB is inverted), strong
             if let (Some(cb), Some(h_r), Some(n_r), Some(cb_r)) =
                 (cb_curr, h_ref_val, n_ref_val, cb_curr_ref)
             {
-                let peak = UnlabeledPeak::hncacb(h_val, n_val, cb, 0.8);
+                let peak = UnlabeledPeak::hncacb(h_val, n_val, cb, -0.8);
                 let reference = vec![
                     ("H".to_string(), h_r),
                     ("N".to_string(), n_r),
                     ("CB".to_string(), cb_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CB(i)+", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CB(i)-", reference);
                 hncacb.push(peak);
             }
-            // Inter-residue CA(i-1) - negative
+            // Inter-residue CA(i-1) - POSITIVE (CA is positive), weak
             // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for CA
             if let (Some(ca), Some(h_r), Some(n_r), Some(ca_r)) =
                 (ca_prev, h_ref_val, n_ref_val, ca_prev_ref)
             {
-                let peak = UnlabeledPeak::hncacb(h_val, n_val, ca, -0.3);
+                let peak = UnlabeledPeak::hncacb(h_val, n_val, ca, 0.3);
                 let reference = vec![
                     ("H".to_string(), h_r),
                     ("N".to_string(), n_r),
                     ("CA".to_string(), ca_r),
                 ];
-                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)-", reference);
+                ground_truth.register_with_reference(&peak, curr_seq, "H/N/CA(i-1)+", reference);
                 hncacb.push(peak);
             }
-            // Inter-residue CB(i-1) - negative
+            // Inter-residue CB(i-1) - negative, weak
             if let (Some(cb), Some(h_r), Some(n_r), Some(cb_r)) =
                 (cb_prev, h_ref_val, n_ref_val, cb_prev_ref)
             {
@@ -2132,12 +2137,13 @@ fn generate_synthetic_peaks(
         }
 
         // CBCACONH: (H, N, CA/CB) - only i-1 carbons
+        // Use sign encoding consistent with HNCACB: CA positive, CB negative
         // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for carbons
         if filter.should_include("cbcaconh") {
             if let (Some(ca), Some(h_r), Some(n_r), Some(ca_r)) =
                 (ca_prev, h_ref_val, n_ref_val, ca_prev_ref)
             {
-                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, ca, 1.0);
+                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, ca, 1.0);  // CA positive
                 let reference = vec![
                     ("H".to_string(), h_r),
                     ("N".to_string(), n_r),
@@ -2149,7 +2155,7 @@ fn generate_synthetic_peaks(
             if let (Some(cb), Some(h_r), Some(n_r), Some(cb_r)) =
                 (cb_prev, h_ref_val, n_ref_val, cb_prev_ref)
             {
-                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, cb, 0.8);
+                let peak = UnlabeledPeak::cbcaconh(h_val, n_val, cb, -0.8);  // CB negative (consistent with HNCACB)
                 let reference = vec![
                     ("H".to_string(), h_r),
                     ("N".to_string(), n_r),
@@ -3083,7 +3089,7 @@ fn run_batch_mode(entry_id: u32, output_dir: PathBuf, windows: &str, verbose: bo
             let results = run_unified_assignment(
                 &hsqc_15n, &hsqc_13c, &tocsy, &noesy, &hsqc_tocsy_15n, &hsqc_tocsy_13c,
                 &hsqc_tocsy_15n_3d, &hsqc_tocsy_13c_3d,
-                &hnco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
+                &hnco, &hncaco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
                 &sequence, &params
             );
             let elapsed = start_time.elapsed();
@@ -3385,7 +3391,7 @@ fn run_grid_search_mode(
                     let results = run_unified_assignment(
                         &hsqc_15n, &hsqc_13c, &tocsy_peaks, &noesy, &hsqc_tocsy_15n, &hsqc_tocsy_13c,
                         &hsqc_tocsy_15n_3d, &hsqc_tocsy_13c_3d,
-                        &hnco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
+                        &hnco, &hncaco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
                         &sequence, &params
                     );
                     let elapsed = start.elapsed();

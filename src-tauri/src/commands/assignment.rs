@@ -550,6 +550,7 @@ pub async fn run_real_assignment(
     let hsqc_tocsy_15n_3d: Vec<UnlabeledPeak> = vec![];
     let hsqc_tocsy_13c_3d: Vec<UnlabeledPeak> = vec![];
     let hnco: Vec<UnlabeledPeak> = vec![];
+    let hncaco: Vec<UnlabeledPeak> = vec![];
     let hnca: Vec<UnlabeledPeak> = vec![];
     let hncacb: Vec<UnlabeledPeak> = vec![];
     let cbcaconh: Vec<UnlabeledPeak> = vec![];
@@ -559,7 +560,7 @@ pub async fn run_real_assignment(
         &hsqc_15n, &hsqc_13c, &tocsy, &noesy,
         &hsqc_tocsy_15n, &hsqc_tocsy_13c,
         &hsqc_tocsy_15n_3d, &hsqc_tocsy_13c_3d,
-        &hnco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
+        &hnco, &hncaco, &hnca, &hncacb, &cbcaconh, &hbhaconh,
         &molecule.sequence, &params
     );
 
