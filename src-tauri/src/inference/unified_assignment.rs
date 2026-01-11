@@ -1430,8 +1430,55 @@ fn compute_group_fit(
     (-0.5 * (d_h * d_h + d_n * d_n)).exp()
 }
 
-/// Find unique backbone (H, N) centers from observations.
-/// Uses clustering to identify distinct spin systems.
+/// Compute Mahalanobis distance between two (H, N) points.
+/// This accounts for the different measurement precision of H vs N:
+/// - H has ~10x better precision than N (tighter line width)
+/// - Using Mahalanobis distance prevents rectangular tolerance artifacts
+///
+/// CRYSTALLINE-compatible: This maps to the precision matrix (inverse covariance)
+/// in GaussianComponent<2> for backbone (H, N) density.
+fn compute_mahalanobis_distance(
+    h_a: f64, n_a: f64,
+    h_b: f64, n_b: f64,
+    sigma_h: f64, sigma_n: f64,
+) -> f64 {
+    // precision_h = 1/σ_H², precision_n = 1/σ_N² (diagonal precision matrix)
+    let d_h = (h_a - h_b) / sigma_h;
+    let d_n = (n_a - n_b) / sigma_n;
+    (d_h * d_h + d_n * d_n).sqrt()
+}
+
+/// Find unique backbone (H, N) centers from observations using Mahalanobis distance.
+/// Uses covariance-aware clustering to identify distinct spin systems.
+///
+/// CRYSTALLINE-compatible: This performs density peak detection - each center
+/// represents a local maximum in the (H, N) density field.
+fn find_backbone_centers_mahalanobis(
+    observations: &[Observation],
+    backbone_indices: &[usize],
+    sigma_h: f64,         // H measurement uncertainty (e.g., 0.015 ppm)
+    sigma_n: f64,         // N measurement uncertainty (e.g., 0.15 ppm)
+    d_mahal_threshold: f64,  // Merge if d_mahal < threshold (e.g., 2.0 for 2-sigma)
+) -> Vec<(f64, f64)> {
+    let mut centers: Vec<(f64, f64)> = Vec::new();
+
+    for &idx in backbone_indices {
+        let Some((h, n)) = get_backbone_hn_from_obs(&observations[idx]) else { continue };
+
+        // Check if this (H, N) matches any existing center using Mahalanobis distance
+        let matches_existing = centers.iter().any(|(h_c, n_c)| {
+            compute_mahalanobis_distance(h, n, *h_c, *n_c, sigma_h, sigma_n) < d_mahal_threshold
+        });
+
+        if !matches_existing {
+            centers.push((h, n));
+        }
+    }
+
+    centers
+}
+
+/// Legacy function for backward compatibility - uses hard rectangular tolerance
 fn find_backbone_centers(
     observations: &[Observation],
     backbone_indices: &[usize],
@@ -1458,6 +1505,11 @@ fn find_backbone_centers(
 
 /// Create soft backbone groups with weighted observation contributions.
 /// Observations can contribute to multiple groups based on fit quality.
+///
+/// CRYSTALLINE-compatible: This implements GMM-style soft clustering where:
+/// - Centers are detected using Mahalanobis distance (covariance-aware)
+/// - Observations contribute to groups with Gaussian likelihood weights (responsibilities)
+/// - Multiple groups can claim partial ownership of ambiguous observations
 fn create_soft_backbone_groups(
     observations: &[Observation],
     backbone_indices: &[usize],
@@ -1465,12 +1517,15 @@ fn create_soft_backbone_groups(
     sigma_n: f64,  // Gaussian width for N (for soft weighting)
     fit_threshold: f64,  // Minimum fit quality to contribute (e.g., 0.01)
 ) -> Vec<SoftSpinSystemEvidence> {
-    // 1. Find unique backbone centers using TIGHT tolerance for initial clustering
-    // This ensures we get one center per distinct spin system
-    // The soft weighting (sigma_h, sigma_n) allows for overlapped peak contributions
-    let center_h_tol = 0.03;  // Tight: 0.03 ppm for H
-    let center_n_tol = 0.3;   // Tight: 0.3 ppm for N
-    let centers = find_backbone_centers(observations, backbone_indices, center_h_tol, center_n_tol);
+    // 1. Find unique backbone centers using MAHALANOBIS distance
+    // This properly accounts for the different precision of H vs N:
+    // - H line width ~0.015 ppm (10x more discriminating)
+    // - N line width ~0.15 ppm
+    // A 2-sigma threshold means d_mahal < 2.0 to merge
+    let d_mahal_threshold = 2.0;  // 2-sigma ellipse
+    let centers = find_backbone_centers_mahalanobis(
+        observations, backbone_indices, sigma_h, sigma_n, d_mahal_threshold
+    );
 
     // 2. Create soft groups for each center
     let mut groups: Vec<SoftSpinSystemEvidence> = centers.iter()
@@ -1478,7 +1533,7 @@ fn create_soft_backbone_groups(
         .map(|(idx, (h, n))| SoftSpinSystemEvidence::new(idx, *h, *n))
         .collect();
 
-    // 3. Assign observations to groups with weighted contribution
+    // 3. Assign observations to groups with weighted contribution (GMM responsibilities)
     for &obs_idx in backbone_indices {
         let Some((obs_h, obs_n)) = get_backbone_hn_from_obs(&observations[obs_idx]) else { continue };
 
@@ -5174,42 +5229,56 @@ pub fn run_observation_assignment(
         .map(|(idx, _)| idx)
         .collect();
 
-    // Create backbone GROUPS by (H, N) coordinates (HARD GROUPING)
-    // Observations with same backbone (H, N) should be treated as one unit
-    // This prevents multiple HNCA/HNCACB from same backbone competing against each other
-    let h_tolerance = 0.03;  // 0.03 ppm for H grouping
-    let n_tolerance = 0.3;   // 0.3 ppm for N grouping
+    // ==========================================================================
+    // CRYSTALLINE-COMPATIBLE SOFT GROUPING (Mahalanobis + GMM)
+    // ==========================================================================
+    //
+    // Replace hard rectangular tolerance with covariance-aware Mahalanobis distance.
+    // This properly accounts for different H vs N measurement precision:
+    //   σ_H = 0.015 ppm (H line width - 10x more discriminating)
+    //   σ_N = 0.15 ppm  (N line width)
+    //
+    // Example: For residues 69 L (H=8.340, N=124.460) and 73 L (H=8.320, N=124.220):
+    //   Hard tolerance: ΔH=0.02<0.03, ΔN=0.24<0.30 → MERGE (wrong!)
+    //   Mahalanobis: d = sqrt((0.02/0.015)² + (0.24/0.15)²) = 2.08 > 2.0 → SEPARATE (correct!)
 
-    // Group backbone observations by (H, N) coordinates
-    // Each group represents one backbone spin system
-    let mut backbone_groups: Vec<Vec<usize>> = Vec::new();
-    let mut assigned_to_group: HashSet<usize> = HashSet::new();
+    let sigma_h = 0.015;  // H measurement uncertainty (ppm)
+    let sigma_n = 0.15;   // N measurement uncertainty (ppm)
+    let fit_threshold = 0.1;  // Minimum Gaussian likelihood to contribute to a group
 
-    for &idx_a in &backbone_indices {
-        if assigned_to_group.contains(&idx_a) {
-            continue;
+    // Step 1: Create soft backbone groups using Mahalanobis-based center detection
+    let mut soft_groups = create_soft_backbone_groups(
+        observations, &backbone_indices, sigma_h, sigma_n, fit_threshold
+    );
+
+    // Step 2: Iterative center refinement (EM-like, CRYSTALLINE density evolution)
+    // This allows groups to "crystallize" toward their true centers
+    let em_iterations = 5;
+    for _iteration in 0..em_iterations {
+        // E-step: Recompute responsibilities with current centers
+        recompute_group_weights(&mut soft_groups, observations, &backbone_indices, sigma_h, sigma_n, fit_threshold);
+
+        // M-step: Update centers toward weighted mean
+        for group in &mut soft_groups {
+            group.update_center_from_weights(observations);
         }
-        let Some((h_a, n_a)) = get_backbone_hn_from_obs(&observations[idx_a]) else { continue };
-
-        // Start a new group with this observation
-        let mut group = vec![idx_a];
-        assigned_to_group.insert(idx_a);
-
-        // Find all other backbone observations with matching (H, N)
-        for &idx_b in &backbone_indices {
-            if idx_a == idx_b || assigned_to_group.contains(&idx_b) {
-                continue;
-            }
-            let Some((h_b, n_b)) = get_backbone_hn_from_obs(&observations[idx_b]) else { continue };
-
-            if (h_a - h_b).abs() < h_tolerance && (n_a - n_b).abs() < n_tolerance {
-                group.push(idx_b);
-                assigned_to_group.insert(idx_b);
-            }
-        }
-
-        backbone_groups.push(group);
     }
+
+    // Step 3: Detect and split multimodal groups (overlapping H/N with different CA)
+    // This handles exact H/N overlap cases where two residues have identical backbone
+    detect_and_split_multimodal_groups(&mut soft_groups, observations, 2.0, params.verbose);
+
+    // Convert soft groups to observation index lists for downstream compatibility
+    // For each soft group, use the observations with weight > 0.5 (primary membership)
+    let backbone_groups: Vec<Vec<usize>> = soft_groups.iter()
+        .map(|group| {
+            group.observation_weights.iter()
+                .filter(|(_, &weight)| weight > 0.5)
+                .map(|(&idx, _)| idx)
+                .collect()
+        })
+        .filter(|group: &Vec<usize>| !group.is_empty())
+        .collect();
 
     if params.verbose {
         println!("\n=== BACKBONE GROUPING ===");
