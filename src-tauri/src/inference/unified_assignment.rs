@@ -652,6 +652,8 @@ pub struct SpinSystemEvidence {
     pub inter_carbons: HashMap<String, f64>,
     /// Intra-residue proton shifts (from TOCSY/HSQC-13C): atom_type -> shift
     pub intra_protons: HashMap<String, f64>,
+    /// Inter-residue proton shifts (from HBHACONH): HA(i-1), HB(i-1)
+    pub inter_protons: HashMap<String, f64>,
 }
 
 impl SpinSystemEvidence {
@@ -666,6 +668,7 @@ impl SpinSystemEvidence {
         let mut intra_carbons: HashMap<String, f64> = HashMap::new();
         let mut inter_carbons: HashMap<String, f64> = HashMap::new();
         let mut intra_protons: HashMap<String, f64> = HashMap::new();
+        let mut inter_protons: HashMap<String, f64> = HashMap::new();
 
         // Find backbone (H, N) from any observation in the group
         for &idx in obs_indices {
@@ -723,9 +726,31 @@ impl SpinSystemEvidence {
                         }
                     }
                     NucleusType::H1 => {
-                        // Sidechain protons from TOCSY
-                        if dim.atom_hint.as_deref() != Some("H") &&
-                           dim.atom_hint.as_deref() != Some("HN") {
+                        // Check if this is an aliphatic proton (HA/HB from HBHACONH)
+                        let is_aliphatic = match &dim.atom_constraint {
+                            AtomConstraint::Exact(s) => s.starts_with("HA") || s.starts_with("HB"),
+                            AtomConstraint::OneOf(v) => v.iter().any(|s| s.starts_with("HA") || s.starts_with("HB")),
+                            AtomConstraint::Any => false,
+                        };
+
+                        if is_aliphatic {
+                            // Determine HA vs HB based on shift (HA ~4.3, HB ~1.5-3.0)
+                            let atom_type = if dim.shift > 3.5 { "HA".to_string() } else { "HB".to_string() };
+
+                            let is_dim_intra = match dim.residue_offset {
+                                ResidueOffset::Intra => true,
+                                ResidueOffset::PrecedingResidue => false,
+                                _ => is_intra,
+                            };
+
+                            if is_dim_intra {
+                                intra_protons.insert(atom_type, dim.shift);
+                            } else {
+                                inter_protons.insert(atom_type, dim.shift);
+                            }
+                        } else if dim.atom_hint.as_deref() != Some("H") &&
+                                  dim.atom_hint.as_deref() != Some("HN") {
+                            // Sidechain protons from TOCSY (not backbone H)
                             if let Some(hint) = &dim.atom_hint {
                                 intra_protons.insert(hint.clone(), dim.shift);
                             }
@@ -744,6 +769,7 @@ impl SpinSystemEvidence {
             intra_carbons,
             inter_carbons,
             intra_protons,
+            inter_protons,
         }
     }
 
@@ -1245,6 +1271,17 @@ pub struct WeightedCarbon {
     pub obs_idx: usize,
 }
 
+/// Weighted proton observation (similar to WeightedCarbon)
+#[derive(Debug, Clone)]
+pub struct WeightedProton {
+    /// Chemical shift in ppm
+    pub shift: f64,
+    /// Fit quality weight (0-1) based on (H, N) match to group center
+    pub weight: f64,
+    /// Observation index this came from
+    pub obs_idx: usize,
+}
+
 /// Soft spin system evidence - allows observations to contribute to multiple groups
 /// with weighted probability based on chemical shift fit.
 #[derive(Debug, Clone)]
@@ -1258,6 +1295,10 @@ pub struct SoftSpinSystemEvidence {
     pub intra_carbons: HashMap<String, Vec<WeightedCarbon>>,
     /// Inter-residue carbons: atom_type -> Vec of weighted contributions
     pub inter_carbons: HashMap<String, Vec<WeightedCarbon>>,
+    /// Intra-residue protons: atom_type -> Vec of weighted contributions (HA, HB from HBHACONH etc)
+    pub intra_protons: HashMap<String, Vec<WeightedProton>>,
+    /// Inter-residue protons: atom_type -> Vec of weighted contributions (HA(i-1), HB(i-1) from HBHACONH)
+    pub inter_protons: HashMap<String, Vec<WeightedProton>>,
     /// Observation weights: obs_idx -> fit_quality
     pub observation_weights: HashMap<usize, f64>,
     /// Total weight from all observations (for normalization)
@@ -1273,6 +1314,8 @@ impl SoftSpinSystemEvidence {
             n_center,
             intra_carbons: HashMap::new(),
             inter_carbons: HashMap::new(),
+            intra_protons: HashMap::new(),
+            inter_protons: HashMap::new(),
             observation_weights: HashMap::new(),
             total_weight: 0.0,
         }
@@ -1283,8 +1326,8 @@ impl SoftSpinSystemEvidence {
         self.observation_weights.insert(obs_idx, weight);
         self.total_weight += weight;
 
-        // Add carbons with weighted contribution
         for dim in &obs.dimensions {
+            // Add carbons with weighted contribution
             if dim.nucleus == NucleusType::C13 {
                 let atom_type = match &dim.atom_constraint {
                     AtomConstraint::Exact(s) => s.clone(),
@@ -1309,6 +1352,59 @@ impl SoftSpinSystemEvidence {
                     self.intra_carbons.entry(atom_type).or_default().push(wc);
                 } else {
                     self.inter_carbons.entry(atom_type).or_default().push(wc);
+                }
+            }
+            // Add aliphatic protons (HA, HB from HBHACONH etc) - NOT backbone H/HN
+            else if dim.nucleus == NucleusType::H1 {
+                // Check if this is an aliphatic proton (HA/HB), not backbone H
+                let is_aliphatic = match &dim.atom_constraint {
+                    AtomConstraint::Exact(s) => s.starts_with("HA") || s.starts_with("HB"),
+                    AtomConstraint::OneOf(v) => v.iter().any(|s| s.starts_with("HA") || s.starts_with("HB")),
+                    AtomConstraint::Any => false, // Don't know, skip
+                };
+
+                if is_aliphatic {
+                    // Determine atom type - use "HA" or "HB" as generic type
+                    let atom_type = match &dim.atom_constraint {
+                        AtomConstraint::Exact(s) => {
+                            if s.starts_with("HA") { "HA".to_string() }
+                            else { "HB".to_string() }
+                        },
+                        AtomConstraint::OneOf(v) => {
+                            // HBHACONH has mixed HA/HB - check hint or first match
+                            if let Some(hint) = &dim.atom_hint {
+                                if hint.starts_with("HA") { "HA".to_string() }
+                                else { "HB".to_string() }
+                            } else if v.iter().any(|s| s.starts_with("HA")) && !v.iter().any(|s| s.starts_with("HB")) {
+                                "HA".to_string()
+                            } else if v.iter().any(|s| s.starts_with("HB")) && !v.iter().any(|s| s.starts_with("HA")) {
+                                "HB".to_string()
+                            } else {
+                                // Mixed HA/HB - use shift to discriminate (HA ~4.3, HB ~1.5-3.0)
+                                if dim.shift > 3.5 { "HA".to_string() } else { "HB".to_string() }
+                            }
+                        },
+                        AtomConstraint::Any => "H_ali".to_string(),
+                    };
+
+                    let wp = WeightedProton {
+                        shift: dim.shift,
+                        weight,
+                        obs_idx,
+                    };
+
+                    // Use residue_offset for intra/inter
+                    let is_intra = match dim.residue_offset {
+                        ResidueOffset::Intra => true,
+                        ResidueOffset::PrecedingResidue => false,
+                        _ => obs.intensity > 0.5,
+                    };
+
+                    if is_intra {
+                        self.intra_protons.entry(atom_type).or_default().push(wp);
+                    } else {
+                        self.inter_protons.entry(atom_type).or_default().push(wp);
+                    }
                 }
             }
         }
@@ -1342,6 +1438,34 @@ impl SoftSpinSystemEvidence {
         Some(weighted_sum / total_weight)
     }
 
+    /// Get weighted average shift for an intra proton atom type (HA, HB)
+    pub fn get_weighted_intra_proton(&self, atom_type: &str) -> Option<f64> {
+        let protons = self.intra_protons.get(atom_type)?;
+        if protons.is_empty() {
+            return None;
+        }
+        let total_weight: f64 = protons.iter().map(|p| p.weight).sum();
+        if total_weight < 0.001 {
+            return None;
+        }
+        let weighted_sum: f64 = protons.iter().map(|p| p.shift * p.weight).sum();
+        Some(weighted_sum / total_weight)
+    }
+
+    /// Get weighted average shift for an inter proton atom type (HA(i-1), HB(i-1))
+    pub fn get_weighted_inter_proton(&self, atom_type: &str) -> Option<f64> {
+        let protons = self.inter_protons.get(atom_type)?;
+        if protons.is_empty() {
+            return None;
+        }
+        let total_weight: f64 = protons.iter().map(|p| p.weight).sum();
+        if total_weight < 0.001 {
+            return None;
+        }
+        let weighted_sum: f64 = protons.iter().map(|p| p.shift * p.weight).sum();
+        Some(weighted_sum / total_weight)
+    }
+
     /// Move center toward weighted average of contributing observations
     pub fn update_center_from_weights(&mut self, observations: &[Observation]) {
         let mut sum_h = 0.0;
@@ -1369,6 +1493,8 @@ impl SoftSpinSystemEvidence {
     pub fn clear_contributions(&mut self) {
         self.intra_carbons.clear();
         self.inter_carbons.clear();
+        self.intra_protons.clear();
+        self.inter_protons.clear();
         self.observation_weights.clear();
         self.total_weight = 0.0;
     }
@@ -1379,20 +1505,34 @@ impl SoftSpinSystemEvidence {
     }
 
     /// Convert to SpinSystemEvidence format for compatibility with typing functions.
-    /// Uses weighted averages for carbon shifts.
+    /// Uses weighted averages for carbon and proton shifts.
     pub fn to_spin_system_evidence(&self) -> SpinSystemEvidence {
         let mut intra_carbons: HashMap<String, f64> = HashMap::new();
         let mut inter_carbons: HashMap<String, f64> = HashMap::new();
+        let mut intra_protons: HashMap<String, f64> = HashMap::new();
+        let mut inter_protons: HashMap<String, f64> = HashMap::new();
 
         // Compute weighted average for each carbon type
-        for (atom_type, carbons) in &self.intra_carbons {
+        for (atom_type, _carbons) in &self.intra_carbons {
             if let Some(avg) = self.get_weighted_intra_carbon(atom_type) {
                 intra_carbons.insert(atom_type.clone(), avg);
             }
         }
-        for (atom_type, carbons) in &self.inter_carbons {
+        for (atom_type, _carbons) in &self.inter_carbons {
             if let Some(avg) = self.get_weighted_inter_carbon(atom_type) {
                 inter_carbons.insert(atom_type.clone(), avg);
+            }
+        }
+
+        // Compute weighted average for each proton type
+        for (atom_type, _protons) in &self.intra_protons {
+            if let Some(avg) = self.get_weighted_intra_proton(atom_type) {
+                intra_protons.insert(atom_type.clone(), avg);
+            }
+        }
+        for (atom_type, _protons) in &self.inter_protons {
+            if let Some(avg) = self.get_weighted_inter_proton(atom_type) {
+                inter_protons.insert(atom_type.clone(), avg);
             }
         }
 
@@ -1403,7 +1543,8 @@ impl SoftSpinSystemEvidence {
             n_shift: self.n_center,
             intra_carbons,
             inter_carbons,
-            intra_protons: HashMap::new(),
+            intra_protons,
+            inter_protons,
         }
     }
 }
@@ -1594,9 +1735,15 @@ fn detect_and_split_multimodal_groups(
             continue;
         }
 
-        // Filter to only TRUE intra observations (intensity > 0.5)
+        // Separate TRUE intra observations (intensity > 0.5) from inter observations
         let intra_shifts: Vec<(f64, usize, f64)> = ca_carbons.iter()
             .filter(|wc| observations[wc.obs_idx].intensity > 0.5)
+            .map(|wc| (wc.shift, wc.obs_idx, wc.weight))
+            .collect();
+
+        // Also collect INTER CA shifts (intensity <= 0.5) - needed for matching inter-CB
+        let inter_shifts: Vec<(f64, usize, f64)> = ca_carbons.iter()
+            .filter(|wc| observations[wc.obs_idx].intensity <= 0.5)
             .map(|wc| (wc.shift, wc.obs_idx, wc.weight))
             .collect();
 
@@ -1612,19 +1759,131 @@ fn detect_and_split_multimodal_groups(
             // Bimodal INTRA CAs! This suggests two different residues wrongly merged
             let midpoint = (min_shift + max_shift) / 2.0;
 
-            // Collect observations for each cluster (use ALL observations, not just CA)
-            let mut low_obs: Vec<(usize, f64)> = Vec::new();
-            let mut high_obs: Vec<(usize, f64)> = Vec::new();
-
-            for &(shift, obs_idx, weight) in &intra_shifts {
-                if shift < midpoint {
-                    low_obs.push((obs_idx, weight));
-                } else {
-                    high_obs.push((obs_idx, weight));
+            if verbose {
+                println!("  Bimodal CA detected in group {}: intra_shifts={}, inter_shifts={}",
+                    group_idx, intra_shifts.len(), inter_shifts.len());
+                for (shift, obs_idx, _w) in &intra_shifts {
+                    let obs = &observations[*obs_idx];
+                    println!("    intra CA={:.2} (obs {}, intensity={:.2})", shift, obs_idx, obs.intensity);
+                }
+                for (shift, obs_idx, _w) in &inter_shifts {
+                    let obs = &observations[*obs_idx];
+                    println!("    inter CA={:.2} (obs {}, intensity={:.2})", shift, obs_idx, obs.intensity);
                 }
             }
 
-            // Only split if both clusters have intra observations
+            // Collect observations for each cluster
+            // First, determine which CA cluster each CA observation belongs to
+            let mut ca_obs_to_cluster: HashMap<usize, bool> = HashMap::new(); // true = high, false = low
+
+            for &(shift, obs_idx, _weight) in &intra_shifts {
+                ca_obs_to_cluster.insert(obs_idx, shift >= midpoint);
+            }
+
+            // Now, assign ALL observations to clusters based on their CA association
+            // For non-CA observations (CB, C), find the closest CA observation with same (H, N)
+            let mut low_obs: Vec<(usize, f64)> = Vec::new();
+            let mut high_obs: Vec<(usize, f64)> = Vec::new();
+
+            for (&obs_idx, &weight) in &group.observation_weights {
+                let obs = &observations[obs_idx];
+
+                // Check if this observation has CA
+                let obs_ca: Option<f64> = obs.dimensions.iter()
+                    .find(|d| d.nucleus == NucleusType::C13 &&
+                        (d.atom_constraint == AtomConstraint::Exact("CA".to_string()) ||
+                         d.atom_hint.as_deref() == Some("CA")))
+                    .map(|d| d.shift);
+
+                if let Some(ca_shift) = obs_ca {
+                    // This observation has CA - assign based on CA shift
+                    if ca_shift >= midpoint {
+                        high_obs.push((obs_idx, weight));
+                    } else {
+                        low_obs.push((obs_idx, weight));
+                    }
+                } else {
+                    // This observation doesn't have CA (e.g., CB or C only)
+                    // Use KDE scoring to determine which cluster this carbon belongs to
+
+                    // Get the carbon shift and type from this observation
+                    let carbon_info: Option<(f64, String)> = obs.dimensions.iter()
+                        .find(|d| d.nucleus == NucleusType::C13)
+                        .map(|d| {
+                            let atom_type = match &d.atom_constraint {
+                                AtomConstraint::Exact(s) => s.clone(),
+                                AtomConstraint::OneOf(v) if v.len() == 1 => v[0].clone(),
+                                _ => d.atom_hint.clone().unwrap_or_else(|| "C".to_string()),
+                            };
+                            (d.shift, atom_type)
+                        });
+
+                    let mut assigned_high = low_obs.len() <= high_obs.len(); // Default fallback
+
+                    if let Some((c_shift, atom_type)) = carbon_info {
+                        // For CB/C: Match to a CA cluster using KDE joint scoring
+                        // The intra_shifts define the clusters (low CA vs high CA)
+                        // We use KDE to find which residue type best explains this CB+CA combination
+                        let obs_is_intra = obs.intensity > 0.5;
+
+                        // ALWAYS use intra_shifts for KDE matching since those define the clusters
+                        // (The bimodal split is based on intra-CA, so we match against those)
+                        let ca_shifts_to_use = &intra_shifts;
+
+                        if verbose && (atom_type == "CB" || atom_type == "C") {
+                            println!("    Processing {}={:.2} (obs {}, intra={}): ca_set_size={}",
+                                atom_type, c_shift, obs_idx, obs_is_intra, ca_shifts_to_use.len());
+                        }
+
+                        // Find CA observations to match against
+                        let matching_cas: Vec<(f64, bool)> = ca_shifts_to_use.iter()
+                            .map(|(ca_shift, _, _)| (*ca_shift, *ca_shift >= midpoint))
+                            .collect();
+
+                        if !matching_cas.is_empty() {
+                            // Use KDE to find which CA's residue type best explains this CB
+                            let kde = KDEScorer::new();
+                            let residue_types = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU",
+                                "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO",
+                                "SER", "THR", "TRP", "TYR", "VAL"];
+
+                            let mut best_joint_score = 0.0_f64;
+                            let mut best_is_high = false;
+                            let mut best_res = "";
+
+                            for (ca_shift, is_high) in &matching_cas {
+                                for res in &residue_types {
+                                    let cb_score = kde.score(res, &atom_type, c_shift);
+                                    let ca_score = kde.score(res, "CA", *ca_shift);
+                                    let joint = (cb_score * ca_score).sqrt();
+
+                                    if joint > best_joint_score {
+                                        best_joint_score = joint;
+                                        best_is_high = *is_high;
+                                        best_res = res;
+                                    }
+                                }
+                            }
+
+                            if verbose && atom_type == "CB" {
+                                println!("    CB={:.2} (intra={}): best_res={} joint={:.4} -> {}",
+                                    c_shift, obs_is_intra, best_res, best_joint_score,
+                                    if best_is_high { "HIGH" } else { "LOW" });
+                            }
+
+                            assigned_high = best_is_high;
+                        }
+                    }
+
+                    if assigned_high {
+                        high_obs.push((obs_idx, weight));
+                    } else {
+                        low_obs.push((obs_idx, weight));
+                    }
+                }
+            }
+
+            // Only split if both clusters have observations
             if !low_obs.is_empty() && !high_obs.is_empty() {
                 if verbose {
                     println!("  Splitting group {} (INTRA CA bimodal): {:.1}-{:.1} ppm ({} low, {} high)",
@@ -1691,6 +1950,129 @@ fn detect_and_split_multimodal_groups(
         new_group.group_idx = base_idx + i;
         groups.push(new_group);
     }
+}
+
+/// Compute the probability that a group contains overlapping spin systems (K >= 2)
+/// using Bayesian inference on observation count and carbon variance.
+///
+/// Mathematical model:
+/// - P(n | K=k) = Poisson(n; k * lambda)  where lambda = expected_obs_per_system
+/// - P(K=2 | n) = BF * prior_k2 / (BF * prior_k2 + prior_k1)
+/// - BF = P(n | K=2) / P(n | K=1) = 2^n * e^(-lambda)
+///
+/// CRYSTALLINE-compatible: This is a simplified version of Dirichlet Process
+/// mixture model multiplicity detection.
+fn compute_overlap_probability(
+    observed_count: usize,
+    expected_per_system: f64,
+    intra_ca_values: &[f64],
+    prior_k2: f64,  // Prior probability of overlap (e.g., 0.05)
+) -> f64 {
+    let n = observed_count as f64;
+    let lambda = expected_per_system;
+
+    // 1. Count-based Bayes factor: BF = 2^n * e^(-lambda)
+    // This captures: "too many observations for a single spin system"
+    let bf_count = if lambda > 0.0 {
+        2.0_f64.powf(n) * (-lambda).exp()
+    } else {
+        1.0
+    };
+
+    // 2. Variance-based Bayes factor
+    // Under single spin system: all intra-CA should be identical (measurement error only)
+    // Under overlap: different residues have different CA values
+    let bf_variance = if intra_ca_values.len() >= 2 {
+        let mean: f64 = intra_ca_values.iter().sum::<f64>() / intra_ca_values.len() as f64;
+        let variance: f64 = intra_ca_values.iter()
+            .map(|&x| (x - mean).powi(2))
+            .sum::<f64>() / (intra_ca_values.len() - 1) as f64;
+
+        // Expected variance for single spin system: ~0.04 ppm² (0.2 ppm measurement error)
+        // Expected variance for overlap: ~16 ppm² (4 ppm inter-residue difference)
+        let expected_single_var = 0.04;
+        let expected_overlap_var = 16.0;
+
+        // Likelihood ratio using Gaussian model for variance
+        let ll_overlap = (-variance / (2.0 * expected_overlap_var)).exp();
+        let ll_single = (-variance / (2.0 * expected_single_var)).exp();
+
+        if ll_single > 1e-10 {
+            ll_overlap / ll_single
+        } else {
+            100.0  // Strong evidence for overlap if single hypothesis has near-zero likelihood
+        }
+    } else {
+        1.0  // No variance evidence
+    };
+
+    // 3. Gap-based Bayes factor (bimodality)
+    let bf_gap = if intra_ca_values.len() >= 2 {
+        let mut sorted = intra_ca_values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let max_gap = sorted.windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(0.0_f64, |a, b| a.max(b));
+
+        if max_gap > 3.0 { 20.0 }      // Very strong evidence (>3 ppm gap)
+        else if max_gap > 2.0 { 10.0 } // Strong evidence (>2 ppm gap)
+        else if max_gap > 1.0 { 2.0 }  // Moderate evidence
+        else { 0.5 }                    // Evidence against overlap
+    } else {
+        1.0
+    };
+
+    // Combined Bayes factor
+    let bf_combined = bf_count * bf_variance * bf_gap;
+    let prior_k1 = 1.0 - prior_k2;
+
+    // Posterior probability: P(K=2 | evidence)
+    (bf_combined * prior_k2) / (bf_combined * prior_k2 + prior_k1)
+}
+
+/// Detect groups with high probability of containing overlapping spin systems.
+/// Uses observation count as primary evidence, combined with carbon variance.
+///
+/// This implements Option B from the plan: detect after initial grouping,
+/// flag for splitting, and let BP naturally resolve via soft grouping factors.
+fn detect_probable_overlaps(
+    groups: &[SoftSpinSystemEvidence],
+    observations: &[Observation],
+    expected_obs_per_system: f64,  // e.g., 6.0 for HNCACB + HNCACO
+    overlap_threshold: f64,        // e.g., 0.3 (30% probability)
+    verbose: bool,
+) -> Vec<(usize, f64)> {  // (group_idx, overlap_probability)
+    let mut overlaps = Vec::new();
+
+    for (group_idx, group) in groups.iter().enumerate() {
+        let observed_count = group.observation_weights.len();
+
+        // Get intra-CA values for variance calculation
+        let intra_ca_values: Vec<f64> = group.intra_carbons.get("CA")
+            .map(|cas| cas.iter()
+                .filter(|wc| observations[wc.obs_idx].intensity > 0.5)  // True intra only
+                .map(|wc| wc.shift)
+                .collect())
+            .unwrap_or_default();
+
+        let p_overlap = compute_overlap_probability(
+            observed_count,
+            expected_obs_per_system,
+            &intra_ca_values,
+            0.05,  // Prior: 5% of groups have overlap
+        );
+
+        if p_overlap > overlap_threshold {
+            if verbose {
+                println!("  Group {} (H={:.3}, N={:.2}): P(overlap)={:.2} (n={}, expected={:.0}, CA_count={})",
+                    group_idx, group.h_center, group.n_center,
+                    p_overlap, observed_count, expected_obs_per_system, intra_ca_values.len());
+            }
+            overlaps.push((group_idx, p_overlap));
+        }
+    }
+
+    overlaps
 }
 
 /// Sequential link between two spin systems at the group level.
@@ -2413,11 +2795,28 @@ fn compute_group_typing_scores(
                 }
             }
 
-            // 3. Sidechain protons (if available)
+            // 3. Intra-residue sidechain protons (if available)
             for (atom, &shift) in &group.intra_protons {
                 let density = kde.density(res_type, atom, shift);
                 if density > 0.0 {
                     score *= density.max(1e-10);
+                }
+            }
+
+            // 4. Inter-residue protons from HBHACONH: HA(i-1), HB(i-1)
+            // These should be scored against the PRECEDING residue type
+            if !group.inter_protons.is_empty() && pos > 0 {
+                let prev_res_type = &residue_types[pos - 1];
+                for (atom, &shift) in &group.inter_protons {
+                    // Try multiple atom variants (GLY has HA2/HA3, not HA)
+                    let density = proton_kde_density(kde, prev_res_type, atom, shift);
+                    if density > 0.0 {
+                        score *= density.max(1e-10);
+                    } else {
+                        // Penalty if preceding residue doesn't have this atom
+                        // (e.g., GLY has no HB)
+                        score *= 1e-10;
+                    }
                 }
             }
 
@@ -2434,6 +2833,35 @@ fn compute_group_typing_scores(
 
         scores
     }).collect()
+}
+
+/// Get KDE density for a proton, trying multiple stereospecific variants.
+/// GLY has HA2/HA3 instead of HA, most residues have HB2/HB3 instead of HB.
+fn proton_kde_density(kde: &KDEDatabase, res_type: &str, atom: &str, shift: f64) -> f64 {
+    // First try the exact atom name
+    let direct = kde.density(res_type, atom, shift);
+    if direct > 0.0 {
+        return direct;
+    }
+
+    // Try stereospecific variants
+    match atom {
+        "HA" => {
+            // Try HA2, HA3 (for GLY)
+            let d2 = kde.density(res_type, "HA2", shift);
+            let d3 = kde.density(res_type, "HA3", shift);
+            // Return best match
+            d2.max(d3)
+        }
+        "HB" => {
+            // Try HB1, HB2, HB3 (for different residues)
+            let d1 = kde.density(res_type, "HB1", shift);
+            let d2 = kde.density(res_type, "HB2", shift);
+            let d3 = kde.density(res_type, "HB3", shift);
+            d1.max(d2).max(d3)
+        }
+        _ => 0.0
+    }
 }
 
 /// Extract unique assignments from beliefs using greedy approach.
@@ -2494,6 +2922,20 @@ fn extract_group_assignments(
             let group = &groups[*g];
             println!("  Group {} -> pos {} ({}): conf={:.3}, H={:.3}, N={:.2}",
                 g, pos, res_type, conf, group.h_shift, group.n_shift);
+        }
+        // Debug: Show assignments for groups with H near 8.58 (31 Q / 72 R case)
+        println!("\n--- 31 Q / 72 R case (H~8.58) ---");
+        for (g, pos, conf) in results.iter() {
+            let group = &groups[*g];
+            if (group.h_shift - 8.58).abs() < 0.05 {
+                let res_type = if *pos > 0 && (*pos as usize) <= residue_types.len() {
+                    &residue_types[*pos as usize - 1]
+                } else {
+                    "?"
+                };
+                println!("  Group {} -> pos {} ({}): conf={:.3}, H={:.3}, N={:.2}, CA={:?}",
+                    g, pos, res_type, conf, group.h_shift, group.n_shift, group.intra_carbons.get("CA"));
+            }
         }
         println!("=========================\n");
     }
@@ -5268,6 +5710,45 @@ pub fn run_observation_assignment(
     // This handles exact H/N overlap cases where two residues have identical backbone
     detect_and_split_multimodal_groups(&mut soft_groups, observations, 2.0, params.verbose);
 
+    // Step 4: Probabilistic overlap detection using observation count
+    // Compute expected observations per spin system based on experiments present
+    let expected_obs_per_system: f64 = {
+        let mut count: f64 = 0.0;
+        let has_hncacb = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hncacb);
+        let has_hncaco = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hncaco);
+        let has_hnca = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hnca);
+        let has_hnco = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hnco);
+
+        if has_hncacb { count += 4.0; }  // CA(i), CB(i), CA(i-1), CB(i-1)
+        if has_hncaco { count += 2.0; }  // C'(i), C'(i-1)
+        if has_hnca { count += 2.0; }    // CA(i), CA(i-1)
+        if has_hnco { count += 1.0; }    // C'(i-1)
+
+        count.max(4.0)  // At least 4 expected
+    };
+
+    if params.verbose {
+        println!("\n=== PROBABILISTIC OVERLAP DETECTION ===");
+        println!("Expected observations per spin system: {:.0}", expected_obs_per_system);
+    }
+
+    let probable_overlaps = detect_probable_overlaps(
+        &soft_groups,
+        observations,
+        expected_obs_per_system,
+        0.3,  // Report groups with >30% overlap probability
+        params.verbose,
+    );
+
+    if params.verbose {
+        if probable_overlaps.is_empty() {
+            println!("  No high-probability overlaps detected");
+        } else {
+            println!("  {} groups flagged for potential overlap", probable_overlaps.len());
+        }
+        println!("========================================\n");
+    }
+
     // Convert soft groups to observation index lists for downstream compatibility
     // For each soft group, use the observations with weight > 0.5 (primary membership)
     let backbone_groups: Vec<Vec<usize>> = soft_groups.iter()
@@ -5339,6 +5820,43 @@ pub fn run_observation_assignment(
             println!("    Inter carbons: {:?}", ev.inter_carbons);
         }
         println!("============================\n");
+
+        // Debug: Find groups with carbons that match 31 Q (CA=60.0) or 72 R (CA=55.6)
+        println!("=== SEARCHING FOR 31 Q (CA~60) or 72 R (CA~55.6) ===");
+        for (i, ev) in spin_system_evidence.iter().enumerate() {
+            // Check if any intra or inter CA is near 60.0 (GLN) or 55.6 (ARG)
+            let mut matches = false;
+            let mut match_info = String::new();
+
+            if let Some(&ca_shift) = ev.intra_carbons.get("CA") {
+                if (ca_shift - 60.0).abs() < 1.0 {
+                    matches = true;
+                    match_info.push_str(&format!("intra_CA={:.2} (Q?), ", ca_shift));
+                }
+                if (ca_shift - 55.6).abs() < 1.0 {
+                    matches = true;
+                    match_info.push_str(&format!("intra_CA={:.2} (R?), ", ca_shift));
+                }
+            }
+            if let Some(&ca_shift) = ev.inter_carbons.get("CA") {
+                if (ca_shift - 60.0).abs() < 1.0 {
+                    matches = true;
+                    match_info.push_str(&format!("inter_CA={:.2} (Q?), ", ca_shift));
+                }
+                if (ca_shift - 55.6).abs() < 1.0 {
+                    matches = true;
+                    match_info.push_str(&format!("inter_CA={:.2} (R?), ", ca_shift));
+                }
+            }
+
+            if matches {
+                println!("  Group {} (H={:.3}, N={:.2}): {} - {} obs",
+                    i, ev.h_shift, ev.n_shift, match_info, ev.observation_indices.len());
+                println!("    intra: {:?}", ev.intra_carbons);
+                println!("    inter: {:?}", ev.inter_carbons);
+            }
+        }
+        println!("============================\n");
     }
 
     // 2. Build sequential links between groups
@@ -5353,6 +5871,60 @@ pub fn run_observation_assignment(
             println!("  Group {} -> {} (strength={:.2}, atoms={:?})",
                 link.from_group, link.to_group, link.strength, link.matched_atoms);
         }
+
+        // Debug: Show sequential links and typing for groups with H~8.58 (31 Q / 72 R case)
+        println!("\n=== SEQUENTIAL LINKS FOR 31 Q / 72 R CASE (H~8.58) ===");
+        for (i, ev) in spin_system_evidence.iter().enumerate() {
+            if (ev.h_shift - 8.58).abs() < 0.05 {
+                println!("Group {} (H={:.3}, N={:.2}):", i, ev.h_shift, ev.n_shift);
+                println!("  intra_CA={:?}, intra_CB={:?}", ev.intra_carbons.get("CA"), ev.intra_carbons.get("CB"));
+                println!("  inter_CA={:?}, inter_CB={:?}", ev.inter_carbons.get("CA"), ev.inter_carbons.get("CB"));
+                println!("  intra_protons={:?}", ev.intra_protons);
+                println!("  inter_protons={:?}", ev.inter_protons);
+
+                // Find links FROM this group (where this group's inter matches another's intra)
+                let links_from: Vec<_> = group_sequential_links.iter()
+                    .filter(|l| l.from_group == i)
+                    .collect();
+                if !links_from.is_empty() {
+                    println!("  Links FROM (this group's inter → other's intra):");
+                    for l in links_from {
+                        let to_ev = &spin_system_evidence[l.to_group];
+                        println!("    -> Group {} (H={:.3}, N={:.2}, intra_CA={:?}): str={:.2}, atoms={:?}",
+                            l.to_group, to_ev.h_shift, to_ev.n_shift, to_ev.intra_carbons.get("CA"),
+                            l.strength, l.matched_atoms);
+                    }
+                }
+
+                // Find links TO this group (where another group's inter matches this group's intra)
+                let links_to: Vec<_> = group_sequential_links.iter()
+                    .filter(|l| l.to_group == i)
+                    .collect();
+                if !links_to.is_empty() {
+                    println!("  Links TO (other's inter → this group's intra):");
+                    for l in links_to {
+                        let from_ev = &spin_system_evidence[l.from_group];
+                        println!("    <- Group {} (H={:.3}, N={:.2}, inter_CA={:?}): str={:.2}, atoms={:?}",
+                            l.from_group, from_ev.h_shift, from_ev.n_shift, from_ev.inter_carbons.get("CA"),
+                            l.strength, l.matched_atoms);
+                    }
+                }
+
+                // Show typing scores for positions 31 (GLN) and 72 (ARG)
+                println!("  KDE typing scores:");
+                if let Some(&ca) = ev.intra_carbons.get("CA") {
+                    let gln_ca_score = kde.density("GLN", "CA", ca);
+                    let arg_ca_score = kde.density("ARG", "CA", ca);
+                    println!("    CA={:.2}: GLN={:.4}, ARG={:.4}", ca, gln_ca_score, arg_ca_score);
+                }
+                if let Some(&cb) = ev.intra_carbons.get("CB") {
+                    let gln_cb_score = kde.density("GLN", "CB", cb);
+                    let arg_cb_score = kde.density("ARG", "CB", cb);
+                    println!("    CB={:.2}: GLN={:.4}, ARG={:.4}", cb, gln_cb_score, arg_cb_score);
+                }
+            }
+        }
+        println!("============================\n");
     }
 
     // 3. Run group-level BP
@@ -6303,14 +6875,40 @@ pub fn run_observation_assignment(
         }
 
         let belief = &beliefs[obs_idx];
+
+        // Find best position (including unassigned at index 0)
         let (best_idx, &best_prob) = belief.iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap_or((0, &0.0));
 
+        // FIX: Don't let "unassigned" win when a real position has significant belief.
+        // If best is unassigned (idx 0) but second-best position has belief > 0.2,
+        // prefer the actual position. This handles end-of-sequence cases where
+        // sequential evidence is weak but typing evidence is strong.
+        let (final_idx, final_prob) = if best_idx == 0 {
+            // Find best NON-unassigned position
+            let best_real = belief.iter().enumerate()
+                .skip(1)  // Skip unassigned
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
+
+            if let Some((real_idx, &real_prob)) = best_real {
+                if real_prob > 0.2 {
+                    // Significant belief for a real position - use it
+                    (real_idx, real_prob)
+                } else {
+                    (best_idx, best_prob)
+                }
+            } else {
+                (best_idx, best_prob)
+            }
+        } else {
+            (best_idx, best_prob)
+        };
+
         results.push(ObservationAssignmentResult {
             observation_id: obs.id,
-            assigned_residue: best_idx as i32,
-            confidence: best_prob,
+            assigned_residue: final_idx as i32,
+            confidence: final_prob,
             experiment_type: obs.experiment_type,
         });
     }
@@ -6568,6 +7166,15 @@ fn atoms_from_constraint(constraint: &crate::data::spin_system::AtomConstraint, 
                         result.push("HA2");
                         result.push("HA3");
                     }
+                    "HA2" => result.push("HA2"),
+                    "HA3" => result.push("HA3"),
+                    "HB" => {
+                        result.push("HB");
+                        result.push("HB2");
+                        result.push("HB3");
+                    }
+                    "HB2" => result.push("HB2"),
+                    "HB3" => result.push("HB3"),
                     "N" => result.push("N"),
                     "C" => result.push("C"),
                     // Sidechain carbons (aliphatic + aromatic)

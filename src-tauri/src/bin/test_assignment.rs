@@ -306,9 +306,10 @@ impl GroundTruth {
         // Normalize stereo-equivalent atoms for fair evaluation
         // Pass residue type so we can handle Ile CG1/CG2 correctly
         // Pass ring mode so we can handle PHE/TYR slow ring flip correctly
-        let aa = self.get_aa(residue);
-        let ring_mode = self.get_ring_mode(residue);
-        self.peak_to_atom.insert(peak.id, normalize_stereo_atoms(atom, aa, ring_mode));
+        // Store the atom_desc WITHOUT normalization to preserve stereospecific names
+        // (HB2, HB3, HA2, HA3) for individual tracking. Normalization is only needed
+        // when comparing assigned values to expected values, not for atom tracking.
+        self.peak_to_atom.insert(peak.id, atom.to_string());
         // Store chemical shifts
         let shifts = peak.get_shifts_labeled();
         self.peak_to_shifts.insert(peak.id, shifts);
@@ -719,8 +720,12 @@ fn run_bmrb_mode(entry_id: u32, residue_range: Option<String>, output_json: Opti
                 std::process::exit(1);
             }
         };
-        renumber_shifts(&mut shifts);
     }
+
+    // Always renumber shifts to start from 1
+    // This ensures ground truth residue numbers match the 1-indexed sequence positions
+    // expected by the assignment algorithm
+    renumber_shifts(&mut shifts);
 
     if shifts.is_empty() {
         eprintln!("No shifts found for the specified criteria");
@@ -1388,9 +1393,16 @@ fn generate_peaks_from_bmrb(
         let cb_prev = prev_shifts.iter().find(|s| s.atom_name == "CB").map(|s| s.shift_value);
         let co_prev = prev_shifts.iter().find(|s| s.atom_name == "C").map(|s| s.shift_value);
         let co_curr = curr_shifts.iter().find(|s| s.atom_name == "C").map(|s| s.shift_value);
-        let ha_prev = prev_shifts.iter().find(|s| s.atom_name == "HA" || s.atom_name == "HA2").map(|s| s.shift_value);
-        let hb_prev = prev_shifts.iter().find(|s| s.atom_name == "HB" || s.atom_name == "HB2").map(|s| s.shift_value);
-
+        // Collect ALL HA protons from previous residue (GLY has HA2/HA3, others have HA)
+        let ha_prev_all: Vec<_> = prev_shifts.iter()
+            .filter(|s| s.atom_name == "HA" || s.atom_name == "HA2" || s.atom_name == "HA3")
+            .map(|s| (s.atom_name.as_str(), s.shift_value))
+            .collect();
+        // Collect ALL HB protons from previous residue (most have HB2/HB3, some have HB)
+        let hb_prev_all: Vec<_> = prev_shifts.iter()
+            .filter(|s| s.atom_name == "HB" || s.atom_name == "HB2" || s.atom_name == "HB3")
+            .map(|s| (s.atom_name.as_str(), s.shift_value))
+            .collect();
         // HNCO: (H, N, CO) - correlates NH(i) with CO(i-1)
         // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for C
         if filter.should_include("hnco") {
@@ -1515,15 +1527,18 @@ fn generate_peaks_from_bmrb(
         // HBHACONH: (H, N, HA/HB) - backbone H/N from residue i, sidechain H from i-1
         // Ground truth: Register with curr_seq (backbone anchor residue)
         // The algorithm assigns based on backbone H/N matching
+        // Create a peak for EACH proton (both HB2 and HB3 if they exist)
         if filter.should_include("hbhaconh") {
-            if let Some(ha) = ha_prev {
-                let peak = UnlabeledPeak::hbhaconh(h_val, n_val, ha, 1.0);
-                ground_truth.register(&peak, curr_seq, "H/N/HA(i-1)");
+            for (atom_name, ha) in &ha_prev_all {
+                let peak = UnlabeledPeak::hbhaconh(h_val, n_val, *ha, 1.0);
+                let atom_desc = format!("H/N/{}(i-1)", atom_name);
+                ground_truth.register(&peak, curr_seq, &atom_desc);
                 hbhaconh.push(peak);
             }
-            if let Some(hb) = hb_prev {
-                let peak = UnlabeledPeak::hbhaconh(h_val, n_val, hb, 0.8);
-                ground_truth.register(&peak, curr_seq, "H/N/HB(i-1)");
+            for (atom_name, hb) in &hb_prev_all {
+                let peak = UnlabeledPeak::hbhaconh(h_val, n_val, *hb, 0.8);
+                let atom_desc = format!("H/N/{}(i-1)", atom_name);
+                ground_truth.register(&peak, curr_seq, &atom_desc);
                 hbhaconh.push(peak);
             }
         }
@@ -1609,16 +1624,16 @@ fn generate_synthetic_peaks(
     // Store shifts for sequential experiments (NOESY, 3D triple-resonance)
     // Store observed shifts (potentially noisy) for sequential experiments
     let mut h_shifts: HashMap<i32, f64> = HashMap::new();
-    let mut ha_shifts: HashMap<i32, f64> = HashMap::new();
-    let mut hb_shifts: HashMap<i32, f64> = HashMap::new();
+    // Store ALL stereospecific protons (HA, HA2, HA3, HB, HB2, HB3) per residue
+    // Format: (atom_name, observed_shift, reference_shift)
+    let mut ha_shifts_all: HashMap<i32, Vec<(String, f64, f64)>> = HashMap::new();
+    let mut hb_shifts_all: HashMap<i32, Vec<(String, f64, f64)>> = HashMap::new();
     let mut n_shifts: HashMap<i32, f64> = HashMap::new();
     let mut ca_shifts: HashMap<i32, f64> = HashMap::new();
     let mut cb_shifts: HashMap<i32, f64> = HashMap::new();
     let mut co_shifts: HashMap<i32, f64> = HashMap::new();
     // Store reference shifts (KDE modes) for sequential experiments
     let mut h_refs: HashMap<i32, f64> = HashMap::new();
-    let mut ha_refs: HashMap<i32, f64> = HashMap::new();
-    let mut hb_refs: HashMap<i32, f64> = HashMap::new();
     let mut n_refs: HashMap<i32, f64> = HashMap::new();
     let mut ca_refs: HashMap<i32, f64> = HashMap::new();
     let mut cb_refs: HashMap<i32, f64> = HashMap::new();
@@ -1736,14 +1751,14 @@ fn generate_synthetic_peaks(
                             hsqc_13c.push(peak);
                         }
 
-                        // Track HA/HB for sequential experiments
-                        if *proton_name == "HA" || *proton_name == "HA2" {
-                            ha_shifts.insert(seq_code, h_shift);
-                            ha_refs.insert(seq_code, h_mode);  // KDE mode reference
+                        // Track ALL HA/HB protons for HBHACONH (preserve stereospecific names)
+                        if *proton_name == "HA" || *proton_name == "HA2" || *proton_name == "HA3" {
+                            ha_shifts_all.entry(seq_code).or_default()
+                                .push((proton_name.to_string(), h_shift, h_mode));
                         }
-                        if *proton_name == "HB" || *proton_name == "HB2" {
-                            hb_shifts.insert(seq_code, h_shift);
-                            hb_refs.insert(seq_code, h_mode);  // KDE mode reference
+                        if *proton_name == "HB" || *proton_name == "HB2" || *proton_name == "HB3" {
+                            hb_shifts_all.entry(seq_code).or_default()
+                                .push((proton_name.to_string(), h_shift, h_mode));
                         }
 
                         // Add to proton list for TOCSY (avoid duplicates)
@@ -1781,9 +1796,12 @@ fn generate_synthetic_peaks(
                     let h_shift = add_noise(h_mode, 0.3, &mut rng);
                     residue_protons.push((proton_name.to_string(), h_shift, h_mode));
 
-                    // Track HA for NOESY
-                    if *proton_name == "HA" || *proton_name == "HA2" {
-                        ha_shifts.insert(seq_code, h_shift);
+                    // Track HA for HBHACONH (if not already tracked)
+                    if *proton_name == "HA" || *proton_name == "HA2" || *proton_name == "HA3" {
+                        let entry = ha_shifts_all.entry(seq_code).or_default();
+                        if !entry.iter().any(|(name, _, _)| name == *proton_name) {
+                            entry.push((proton_name.to_string(), h_shift, h_mode));
+                        }
                     }
                 }
             }
@@ -1931,21 +1949,25 @@ fn generate_synthetic_peaks(
     }
 
     // Sequential NOESY: H(i) to HA(i-1)
+    // For NOESY, use the first HA proton from the list
     if filter.should_include("noesy") {
         for i in 2..=sequence.len() as i32 {
             let curr_seq = i;
             let prev_seq = i - 1;
 
-            if let (Some(&h_curr), Some(&ha_prev), Some(&h_ref), Some(&ha_ref)) =
-                (h_shifts.get(&curr_seq), ha_shifts.get(&prev_seq),
-                 h_refs.get(&curr_seq), ha_refs.get(&prev_seq))
+            let h_curr = h_shifts.get(&curr_seq);
+            let h_ref = h_refs.get(&curr_seq);
+            let ha_prev_info = ha_shifts_all.get(&prev_seq).and_then(|v| v.first());
+
+            if let (Some(&h_c), Some(&h_r), Some((ha_name, ha_shift, ha_ref))) =
+                (h_curr, h_ref, ha_prev_info)
             {
-                let peak = UnlabeledPeak::noesy(h_curr, ha_prev, 1.0);
+                let peak = UnlabeledPeak::noesy(h_c, *ha_shift, 1.0);
                 // Register with current residue (where backbone H is)
-                let atom_desc = format!("H(i)/HA(i-1)");
+                let atom_desc = format!("H(i)/{}(i-1)", ha_name);
                 let reference = vec![
-                    ("H1".to_string(), h_ref),   // KDE mode for H(i)
-                    ("H2".to_string(), ha_ref),  // KDE mode for HA(i-1)
+                    ("H1".to_string(), h_r),   // KDE mode for H(i)
+                    ("H2".to_string(), *ha_ref),  // KDE mode for HA(i-1)
                 ];
                 ground_truth.register_with_reference(&peak, curr_seq, &atom_desc, reference);
                 noesy.push(peak);
@@ -1983,8 +2005,9 @@ fn generate_synthetic_peaks(
         let cb_prev = cb_shifts.get(&prev_seq).copied();
         let co_prev = co_shifts.get(&prev_seq).copied();
         let co_curr = co_shifts.get(&curr_seq).copied();
-        let ha_prev_val = ha_shifts.get(&prev_seq).copied();
-        let hb_prev_val = hb_shifts.get(&prev_seq).copied();
+        // Get ALL stereospecific protons from previous residue (for HBHACONH)
+        let ha_prev_all = ha_shifts_all.get(&prev_seq);
+        let hb_prev_all = hb_shifts_all.get(&prev_seq);
         // Reference values (KDE modes) for carbons/protons
         let ca_curr_ref = ca_refs.get(&curr_seq).copied();
         let cb_curr_ref = cb_refs.get(&curr_seq).copied();
@@ -1992,8 +2015,6 @@ fn generate_synthetic_peaks(
         let cb_prev_ref = cb_refs.get(&prev_seq).copied();
         let co_prev_ref = co_refs.get(&prev_seq).copied();
         let co_curr_ref = co_refs.get(&curr_seq).copied();
-        let ha_prev_ref = ha_refs.get(&prev_seq).copied();
-        let hb_prev_ref = hb_refs.get(&prev_seq).copied();
 
         // HNCO: (H, N, CO) - correlates NH(i) with CO(i-1)
         // Ground truth: the CO belongs to residue i-1
@@ -2168,30 +2189,37 @@ fn generate_synthetic_peaks(
 
         // HBHACONH: (H, N, HA/HB) - only i-1 protons
         // Register to curr_seq (where H/N anchor), extraction uses "(i-1)" for protons
+        // Create separate peaks for each stereospecific proton (HA, HA2, HA3, HB, HB2, HB3)
         if filter.should_include("hbhaconh") {
-            if let (Some(ha), Some(h_r), Some(n_r), Some(ha_r)) =
-                (ha_prev_val, h_ref_val, n_ref_val, ha_prev_ref)
-            {
-                let peak = UnlabeledPeak::hbhaconh(h_val, n_val, ha, 1.0);
-                let reference = vec![
-                    ("H".to_string(), h_r),
-                    ("N".to_string(), n_r),
-                    ("HA".to_string(), ha_r),
-                ];
-                ground_truth.register_with_reference(&peak, curr_seq, "H/N/HA(i-1)", reference);
-                hbhaconh.push(peak);
-            }
-            if let (Some(hb), Some(h_r), Some(n_r), Some(hb_r)) =
-                (hb_prev_val, h_ref_val, n_ref_val, hb_prev_ref)
-            {
-                let peak = UnlabeledPeak::hbhaconh(h_val, n_val, hb, 0.8);
-                let reference = vec![
-                    ("H".to_string(), h_r),
-                    ("N".to_string(), n_r),
-                    ("HB".to_string(), hb_r),
-                ];
-                ground_truth.register_with_reference(&peak, curr_seq, "H/N/HB(i-1)", reference);
-                hbhaconh.push(peak);
+            if let (Some(h_r), Some(n_r)) = (h_ref_val, n_ref_val) {
+                // Create peaks for ALL HA protons from previous residue
+                if let Some(ha_list) = ha_prev_all {
+                    for (atom_name, ha_shift, ha_ref) in ha_list {
+                        let peak = UnlabeledPeak::hbhaconh(h_val, n_val, *ha_shift, 1.0);
+                        let reference = vec![
+                            ("H".to_string(), h_r),
+                            ("N".to_string(), n_r),
+                            (atom_name.clone(), *ha_ref),
+                        ];
+                        let atom_desc = format!("H/N/{}(i-1)", atom_name);
+                        ground_truth.register_with_reference(&peak, curr_seq, &atom_desc, reference);
+                        hbhaconh.push(peak);
+                    }
+                }
+                // Create peaks for ALL HB protons from previous residue
+                if let Some(hb_list) = hb_prev_all {
+                    for (atom_name, hb_shift, hb_ref) in hb_list {
+                        let peak = UnlabeledPeak::hbhaconh(h_val, n_val, *hb_shift, 0.8);
+                        let reference = vec![
+                            ("H".to_string(), h_r),
+                            ("N".to_string(), n_r),
+                            (atom_name.clone(), *hb_ref),
+                        ];
+                        let atom_desc = format!("H/N/{}(i-1)", atom_name);
+                        ground_truth.register_with_reference(&peak, curr_seq, &atom_desc, reference);
+                        hbhaconh.push(peak);
+                    }
+                }
             }
         }
     }
@@ -2641,16 +2669,22 @@ fn print_chemical_shift_table(
                     // Note: H_tocsy and H_ali are now properly mapped to actual atoms
                     // by map_nucleus_to_atom(), so we don't filter them out anymore
 
-                    // IMPORTANT: Normalize atom_name based on the ASSIGNED residue's type
-                    // This ensures that when a peak is mis-assigned (e.g., TRP's CD2 assigned to F),
-                    // the atom name is stored with F's normalization rules (CD2→CD).
-                    // Otherwise, direct lookup for (F, "CD2") would find TRP's values when
-                    // F's own CD2 peaks are stored as (F, "CD") due to PHE normalization.
-                    let target_aa = ground_truth.get_aa(target_res);
-                    let target_ring_mode = ground_truth.get_ring_mode(target_res);
-                    let normalized_atom = normalize_stereo_atoms(&atom_name, target_aa, target_ring_mode);
+                    // For stereospecific protons (HB2, HB3, HA2, HA3), keep the exact atom name
+                    // so they can be matched individually rather than averaged.
+                    // For other atoms, normalize to handle equivalent positions.
+                    let is_stereo_proton = atom_name == "HB2" || atom_name == "HB3" ||
+                                          atom_name == "HA2" || atom_name == "HA3";
 
-                    let key = (target_res, normalized_atom);
+                    let final_atom = if is_stereo_proton {
+                        atom_name.clone()
+                    } else {
+                        // Normalize non-stereo atoms
+                        let target_aa = ground_truth.get_aa(target_res);
+                        let target_ring_mode = ground_truth.get_ring_mode(target_res);
+                        normalize_stereo_atoms(&atom_name, target_aa, target_ring_mode)
+                    };
+
+                    let key = (target_res, final_atom);
                     // Collect all observations for averaging
                     assigned_shifts.entry(key).or_default().push(*shift_val);
                 }
