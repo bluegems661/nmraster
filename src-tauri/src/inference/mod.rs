@@ -8,14 +8,6 @@ pub mod belief_propagation;
 pub mod scoring;
 pub mod unified_assignment;
 
-// Legacy modules kept for reference but not exported
-mod assignment;
-mod spin_system_builder;
-mod amino_acid_typing;
-mod sequential_connectivity;
-mod assignment_graph;
-mod sequence_mapper;
-
 #[cfg(test)]
 mod integration_test;
 
@@ -23,16 +15,13 @@ mod integration_test;
 pub use factor_graph::*;
 pub use belief_propagation::*;
 
-// Legacy assignment (for manual shift list assignment)
-pub use assignment::{run_adaptive_assignment, AdaptiveToleranceParams};
-
 // KDE-based scoring (used by unified assignment)
 pub use scoring::{ShiftScorer, KDEScorer, GaussianScorer, DynamicScorer};
 
 // THE unified approach - all evidence in one factor graph
 pub use unified_assignment::{run_unified_assignment, UnifiedAssignmentParams, UnifiedAssignmentResult, PeakType};
 
-// NEW: Observation-based unified model
+// Observation-based unified model (the primary API)
 pub use unified_assignment::{
     Observation, ObservedDimension, GroundTruth,
     NucleusToleranceParams, ToleranceSchedule,

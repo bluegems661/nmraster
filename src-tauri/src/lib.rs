@@ -34,7 +34,6 @@ use commands::{
     add_chemical_shift,
     get_shifts_for_residue,
     list_shift_lists,
-    run_assignment,
     run_real_assignment,
     // Database commands
     init_database,
@@ -126,7 +125,6 @@ pub fn run() {
             add_chemical_shift,
             get_shifts_for_residue,
             list_shift_lists,
-            run_assignment,
             run_real_assignment,
             // Database
             init_database,

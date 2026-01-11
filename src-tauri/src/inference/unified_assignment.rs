@@ -614,6 +614,193 @@ impl Observation {
             .find(|d| d.nucleus == NucleusType::C13 || d.nucleus == NucleusType::N15)
             .map(|d| d.nucleus)
     }
+
+    // =========================================================================
+    // Physics-based query methods (use these instead of experiment_type checks)
+    // =========================================================================
+
+    /// Returns true if this observation has backbone H-N anchor for grouping.
+    /// This replaces: `experiment_type == Hsqc15N || matches!(experiment_type, Hnca | Hncaco | ...)`
+    pub fn has_backbone_hn(&self) -> bool {
+        let has_n15_intra = self.dimensions.iter().any(|d|
+            d.nucleus == NucleusType::N15 && d.residue_offset == ResidueOffset::Intra);
+        let has_h1_intra = self.dimensions.iter().any(|d|
+            d.nucleus == NucleusType::H1 && d.residue_offset == ResidueOffset::Intra);
+        has_n15_intra && has_h1_intra
+    }
+
+    /// Get the backbone (H, N) shifts if present, with H first, N second.
+    /// Returns None if this observation doesn't have a backbone anchor.
+    pub fn backbone_shifts(&self) -> Option<(f64, f64)> {
+        let h_shift = self.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::H1 && d.residue_offset == ResidueOffset::Intra)?
+            .shift;
+        let n_shift = self.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::N15 && d.residue_offset == ResidueOffset::Intra)?
+            .shift;
+        Some((h_shift, n_shift))
+    }
+
+    /// Get all carbon dimensions from this observation.
+    pub fn carbon_dimensions(&self) -> impl Iterator<Item = &ObservedDimension> {
+        self.dimensions.iter().filter(|d| d.nucleus == NucleusType::C13)
+    }
+
+    /// Get all intra-residue carbon dimensions.
+    pub fn intra_carbon_dimensions(&self) -> impl Iterator<Item = &ObservedDimension> {
+        self.dimensions.iter().filter(|d|
+            d.nucleus == NucleusType::C13 && d.residue_offset == ResidueOffset::Intra)
+    }
+
+    /// Get all inter-residue (preceding) carbon dimensions.
+    pub fn inter_carbon_dimensions(&self) -> impl Iterator<Item = &ObservedDimension> {
+        self.dimensions.iter().filter(|d|
+            d.nucleus == NucleusType::C13 && d.residue_offset == ResidueOffset::PrecedingResidue)
+    }
+
+    /// Check if all non-unknown dimensions are intra-residue.
+    /// Returns true for HSQC, TOCSY, etc. where all nuclei are at the same residue.
+    pub fn is_purely_intra(&self) -> bool {
+        self.dimensions.iter()
+            .filter(|d| d.residue_offset != ResidueOffset::Unknown)
+            .all(|d| d.residue_offset == ResidueOffset::Intra)
+    }
+
+    /// Check if any dimension provides inter-residue evidence.
+    /// This is equivalent to `is_sequential_evidence` but computed from dimensions.
+    pub fn has_inter_residue_dimension(&self) -> bool {
+        self.dimensions.iter().any(|d| d.residue_offset == ResidueOffset::PrecedingResidue)
+    }
+
+    // =========================================================================
+    // Nucleus presence checks (for filtering without experiment_type)
+    // =========================================================================
+
+    /// Check if this observation has any N15 dimension.
+    pub fn has_n15(&self) -> bool {
+        self.dimensions.iter().any(|d| d.nucleus == NucleusType::N15)
+    }
+
+    /// Check if this observation has any C13 dimension.
+    pub fn has_c13(&self) -> bool {
+        self.dimensions.iter().any(|d| d.nucleus == NucleusType::C13)
+    }
+
+    /// Check if this observation has any H1 dimension.
+    pub fn has_h1(&self) -> bool {
+        self.dimensions.iter().any(|d| d.nucleus == NucleusType::H1)
+    }
+
+    /// Check if this observation has an intra-residue N15 dimension.
+    pub fn has_intra_n15(&self) -> bool {
+        self.dimensions.iter().any(|d|
+            d.nucleus == NucleusType::N15 && d.residue_offset == ResidueOffset::Intra)
+    }
+
+    /// Check if this observation has an intra-residue C13 dimension.
+    pub fn has_intra_c13(&self) -> bool {
+        self.dimensions.iter().any(|d|
+            d.nucleus == NucleusType::C13 && d.residue_offset == ResidueOffset::Intra)
+    }
+
+    /// Check if this observation has an intra-residue H1 dimension.
+    pub fn has_intra_h1(&self) -> bool {
+        self.dimensions.iter().any(|d|
+            d.nucleus == NucleusType::H1 && d.residue_offset == ResidueOffset::Intra)
+    }
+
+    // =========================================================================
+    // Transfer pathway checks (for filtering without experiment_type)
+    // =========================================================================
+
+    /// Check if this observation is from a direct bond experiment (HSQC).
+    pub fn is_direct_bond(&self) -> bool {
+        self.transfer_pathway == TransferPathway::DirectBond
+    }
+
+    /// Check if this observation is from a through-bond experiment (TOCSY, HSQC-TOCSY).
+    pub fn is_throughbond(&self) -> bool {
+        self.transfer_pathway == TransferPathway::ThroughBond
+    }
+
+    /// Check if this observation is from a through-space experiment (NOESY).
+    pub fn is_throughspace(&self) -> bool {
+        self.transfer_pathway == TransferPathway::ThroughSpace
+    }
+
+    /// Check if this observation is from a backbone sequential experiment (triple resonance).
+    pub fn is_backbone_sequential(&self) -> bool {
+        self.transfer_pathway == TransferPathway::BackboneSequential
+    }
+
+    // =========================================================================
+    // Anchor type checks (for replacing PeakType experiment-specific logic)
+    // =========================================================================
+
+    /// Check if this observation is nitrogen-anchored (intra H + intra N15).
+    /// Replaces experiment_type == Hsqc15N check.
+    pub fn is_nitrogen_anchored(&self) -> bool {
+        self.has_intra_n15() && self.has_intra_h1()
+    }
+
+    /// Check if this observation is carbon-anchored (intra H + intra C13).
+    /// Replaces experiment_type == Hsqc13C check.
+    pub fn is_carbon_anchored(&self) -> bool {
+        self.has_intra_c13() && self.has_intra_h1()
+    }
+
+    /// Check if this observation is HSQC-TOCSY-like: through-bond with N15 anchor.
+    /// Replaces experiment_type == HsqcTocsy15N check.
+    pub fn is_tocsy_n15_anchored(&self) -> bool {
+        self.is_throughbond() && self.has_n15()
+    }
+
+    /// Check if this observation is HSQC-TOCSY-like: through-bond with C13 anchor.
+    /// Replaces experiment_type == HsqcTocsy13C check.
+    pub fn is_tocsy_c13_anchored(&self) -> bool {
+        self.is_throughbond() && self.has_c13()
+    }
+
+    /// Check if this observation is TOCSY-like: through-bond proton-proton correlation.
+    /// Replaces experiment_type == Tocsy check.
+    pub fn is_homonuclear_tocsy(&self) -> bool {
+        self.is_throughbond() &&
+        self.dimensions.iter().filter(|d| d.nucleus == NucleusType::H1).count() >= 2
+    }
+
+    /// Check if this observation is NOESY-like: through-space proton-proton correlation.
+    /// Replaces experiment_type == Noesy check.
+    pub fn is_homonuclear_noesy(&self) -> bool {
+        self.is_throughspace() &&
+        self.dimensions.iter().filter(|d| d.nucleus == NucleusType::H1).count() >= 2
+    }
+}
+
+impl ObservedDimension {
+    /// Check if this dimension is a carbonyl carbon (C').
+    pub fn is_carbonyl(&self) -> bool {
+        matches!(&self.atom_constraint, AtomConstraint::Exact(s) if s == "C")
+    }
+
+    /// Check if this dimension is a CA carbon.
+    pub fn is_ca(&self) -> bool {
+        matches!(&self.atom_constraint, AtomConstraint::Exact(s) if s == "CA")
+    }
+
+    /// Check if this dimension is a CB carbon.
+    pub fn is_cb(&self) -> bool {
+        matches!(&self.atom_constraint, AtomConstraint::Exact(s) if s == "CB")
+    }
+
+    /// Check if this dimension is intra-residue.
+    pub fn is_intra(&self) -> bool {
+        self.residue_offset == ResidueOffset::Intra
+    }
+
+    /// Check if this dimension is inter-residue (preceding).
+    pub fn is_inter(&self) -> bool {
+        self.residue_offset == ResidueOffset::PrecedingResidue
+    }
 }
 
 // =============================================================================
@@ -3252,6 +3439,18 @@ pub struct UnifiedAssignmentResult {
     pub peak_type: PeakType,
 }
 
+/// Carbon atom type for triple-resonance observations.
+/// Physics-based classification derived from atom_constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarbonAtomType {
+    /// Alpha carbon (CA)
+    CA,
+    /// Beta carbon (CB)
+    CB,
+    /// Carbonyl carbon (C')
+    CO,
+}
+
 /// Carbon observation from a 3D triple-resonance experiment, linked to a backbone NH.
 /// Used for both typing (CA/CB shifts are diagnostic) and sequential assignment.
 #[derive(Debug, Clone)]
@@ -3260,12 +3459,10 @@ struct TripleResCarbonObs {
     backbone_idx: usize,
     /// Carbon chemical shift (CA, CB, or CO)
     carbon_shift: f64,
-    /// True = CA, False = CB (for experiments that distinguish)
-    is_ca: bool,
+    /// Carbon atom type: CA, CB, or CO (physics-based, derived from atom_constraint)
+    atom_type: CarbonAtomType,
     /// True = intra-residue (i), False = inter-residue (i-1)
     is_intra: bool,
-    /// Source experiment type
-    source: PeakExperimentType,
 }
 
 /// Sequential connectivity evidence from matching CA/CB shifts across backbone peaks.
@@ -3708,9 +3905,8 @@ impl UnifiedFactorGraph {
                     triple_res_carbons.push(TripleResCarbonObs {
                         backbone_idx: bb_idx,
                         carbon_shift: co,
-                        is_ca: false,  // CO is neither CA nor CB
+                        atom_type: CarbonAtomType::CO,
                         is_intra: false,  // HNCO CO is always from i-1
-                        source: PeakExperimentType::Hnco,
                     });
                 }
             }
@@ -3726,9 +3922,8 @@ impl UnifiedFactorGraph {
                     triple_res_carbons.push(TripleResCarbonObs {
                         backbone_idx: bb_idx,
                         carbon_shift: co,
-                        is_ca: false,  // CO is neither CA nor CB
+                        atom_type: CarbonAtomType::CO,
                         is_intra,
-                        source: PeakExperimentType::Hncaco,
                     });
                 }
             }
@@ -3744,9 +3939,8 @@ impl UnifiedFactorGraph {
                     triple_res_carbons.push(TripleResCarbonObs {
                         backbone_idx: bb_idx,
                         carbon_shift: ca,
-                        is_ca: true,
+                        atom_type: CarbonAtomType::CA,
                         is_intra,
-                        source: PeakExperimentType::Hnca,
                     });
                 }
             }
@@ -3759,14 +3953,13 @@ impl UnifiedFactorGraph {
             if peak.position_ppm.len() >= 3 {
                 let (h, n, c) = (peak.position_ppm[0], peak.position_ppm[1], peak.position_ppm[2]);
                 if let Some(bb_idx) = find_backbone(h, n) {
-                    let is_ca = peak.intensity > 0.0;  // Sign determines CA/CB
+                    let atom_type = if peak.intensity > 0.0 { CarbonAtomType::CA } else { CarbonAtomType::CB };
                     let is_intra = peak.intensity.abs() > 0.5;  // Magnitude determines intra/inter
                     triple_res_carbons.push(TripleResCarbonObs {
                         backbone_idx: bb_idx,
                         carbon_shift: c,
-                        is_ca,
+                        atom_type,
                         is_intra,
-                        source: PeakExperimentType::Hncacb,
                     });
                 }
             }
@@ -3778,13 +3971,12 @@ impl UnifiedFactorGraph {
             if peak.position_ppm.len() >= 3 {
                 let (h, n, c) = (peak.position_ppm[0], peak.position_ppm[1], peak.position_ppm[2]);
                 if let Some(bb_idx) = find_backbone(h, n) {
-                    let is_ca = peak.intensity > 0.0;  // Sign determines CA/CB (consistent with HNCACB)
+                    let atom_type = if peak.intensity > 0.0 { CarbonAtomType::CA } else { CarbonAtomType::CB };
                     triple_res_carbons.push(TripleResCarbonObs {
                         backbone_idx: bb_idx,
                         carbon_shift: c,
-                        is_ca,
+                        atom_type,
                         is_intra: false,  // CBCACONH always shows i-1
-                        source: PeakExperimentType::Cbcaconh,
                     });
                 }
             }
@@ -3809,27 +4001,15 @@ impl UnifiedFactorGraph {
         let mut inter_co_by_bb: HashMap<usize, Vec<f64>> = HashMap::new();
 
         for obs in &triple_res_carbons {
-            if obs.is_ca {
-                // CA from HNCA/HNCACB
-                if obs.is_intra {
-                    intra_ca_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
-                } else {
-                    inter_ca_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
-                }
-            } else if obs.source == PeakExperimentType::Hnco || obs.source == PeakExperimentType::Hncaco {
-                // CO from HNCO/HNCACO
-                if obs.is_intra {
-                    intra_co_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
-                } else {
-                    inter_co_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
-                }
+            let (intra_map, inter_map) = match obs.atom_type {
+                CarbonAtomType::CA => (&mut intra_ca_by_bb, &mut inter_ca_by_bb),
+                CarbonAtomType::CB => (&mut intra_cb_by_bb, &mut inter_cb_by_bb),
+                CarbonAtomType::CO => (&mut intra_co_by_bb, &mut inter_co_by_bb),
+            };
+            if obs.is_intra {
+                intra_map.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
             } else {
-                // CB from HNCACB/CBCACONH
-                if obs.is_intra {
-                    intra_cb_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
-                } else {
-                    inter_cb_by_bb.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
-                }
+                inter_map.entry(obs.backbone_idx).or_default().push(obs.carbon_shift);
             }
         }
 
@@ -3909,10 +4089,10 @@ impl UnifiedFactorGraph {
             println!("  Initial tolerances: H/N={:.3} ppm, CA/CB/CO={:.2} ppm",
                 hn_tolerance, carbon_match_tolerance);
 
-            // Count observations by type
-            let ca_count = triple_res_carbons.iter().filter(|o| o.is_ca).count();
-            let cb_count = triple_res_carbons.iter().filter(|o| !o.is_ca && o.source != PeakExperimentType::Hnco && o.source != PeakExperimentType::Hncaco).count();
-            let co_count = triple_res_carbons.iter().filter(|o| o.source == PeakExperimentType::Hnco || o.source == PeakExperimentType::Hncaco).count();
+            // Count observations by atom type (physics-based)
+            let ca_count = triple_res_carbons.iter().filter(|o| o.atom_type == CarbonAtomType::CA).count();
+            let cb_count = triple_res_carbons.iter().filter(|o| o.atom_type == CarbonAtomType::CB).count();
+            let co_count = triple_res_carbons.iter().filter(|o| o.atom_type == CarbonAtomType::CO).count();
             println!("  Atom types: CA={}, CB={}, CO={}", ca_count, cb_count, co_count);
 
             // Show intra and inter atoms for each backbone
@@ -4287,7 +4467,12 @@ impl UnifiedFactorGraph {
                     continue;
                 }
 
-                let atom_name = if obs.is_ca { "CA" } else { "CB" };
+                // Physics-based: use atom_type enum
+                let atom_name = match obs.atom_type {
+                    CarbonAtomType::CA => "CA",
+                    CarbonAtomType::CB => "CB",
+                    CarbonAtomType::CO => "C",  // Carbonyl is "C" in BMRB
+                };
 
                 for r in 1..self.domain_size {
                     let res_type = &self.residue_types[r - 1];
@@ -5656,17 +5841,9 @@ pub fn run_observation_assignment(
     // The intra/inter distinction is handled when collecting carbon evidence
     let backbone_indices: Vec<usize> = observations.iter().enumerate()
         .filter(|(_, obs)| {
-            // Include HSQC-15N and ALL triple-resonance peaks (both intra and inter)
-            // All of these have backbone (H, N) that anchors them to a residue
-            obs.experiment_type == PeakExperimentType::Hsqc15N ||
-            matches!(obs.experiment_type,
-                PeakExperimentType::Hnca |
-                PeakExperimentType::Hncaco |
-                PeakExperimentType::Hnco |
-                PeakExperimentType::Hncacb |
-                PeakExperimentType::Cbcaconh |
-                PeakExperimentType::Hbhaconh
-            )
+            // Physics-based: any observation with backbone H-N anchor
+            // This includes HSQC-15N, HNCA, HNCACB, HNCO, HNCACO, CBCACONH, HBHACONH, etc.
+            obs.has_backbone_hn()
         })
         .map(|(idx, _)| idx)
         .collect();
@@ -5711,18 +5888,36 @@ pub fn run_observation_assignment(
     detect_and_split_multimodal_groups(&mut soft_groups, observations, 2.0, params.verbose);
 
     // Step 4: Probabilistic overlap detection using observation count
-    // Compute expected observations per spin system based on experiments present
+    // Compute expected observations per spin system based on carbon atom types present
+    // Physics-based: count unique (atom_type, residue_offset) combinations
     let expected_obs_per_system: f64 = {
         let mut count: f64 = 0.0;
-        let has_hncacb = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hncacb);
-        let has_hncaco = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hncaco);
-        let has_hnca = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hnca);
-        let has_hnco = observations.iter().any(|o| o.experiment_type == PeakExperimentType::Hnco);
 
-        if has_hncacb { count += 4.0; }  // CA(i), CB(i), CA(i-1), CB(i-1)
-        if has_hncaco { count += 2.0; }  // C'(i), C'(i-1)
-        if has_hnca { count += 2.0; }    // CA(i), CA(i-1)
-        if has_hnco { count += 1.0; }    // C'(i-1)
+        // Count CA observations (intra and inter)
+        let has_intra_ca = observations.iter().any(|o|
+            o.carbon_dimensions().any(|d| d.is_ca() && d.is_intra()));
+        let has_inter_ca = observations.iter().any(|o|
+            o.carbon_dimensions().any(|d| d.is_ca() && d.is_inter()));
+
+        // Count CB observations (intra and inter)
+        let has_intra_cb = observations.iter().any(|o|
+            o.carbon_dimensions().any(|d| d.is_cb() && d.is_intra()));
+        let has_inter_cb = observations.iter().any(|o|
+            o.carbon_dimensions().any(|d| d.is_cb() && d.is_inter()));
+
+        // Count CO (carbonyl) observations (intra and inter)
+        let has_intra_co = observations.iter().any(|o|
+            o.carbon_dimensions().any(|d| d.is_carbonyl() && d.is_intra()));
+        let has_inter_co = observations.iter().any(|o|
+            o.carbon_dimensions().any(|d| d.is_carbonyl() && d.is_inter()));
+
+        // Each unique (atom_type, residue_offset) contributes 1 expected observation
+        if has_intra_ca { count += 1.0; }
+        if has_inter_ca { count += 1.0; }
+        if has_intra_cb { count += 1.0; }
+        if has_inter_cb { count += 1.0; }
+        if has_intra_co { count += 1.0; }
+        if has_inter_co { count += 1.0; }
 
         count.max(4.0)  // At least 4 expected
     };
@@ -6790,34 +6985,35 @@ pub fn run_observation_assignment(
 
     // TODO: Integrate chain-walking as a POST-HOC verification step, not an override
 
-    // Extract assignments with backbone uniqueness constraint
-    // Each backbone-type observation should map to at most one residue, but different
-    // experiment types can confirm the same residue.
-    // - HSQC15N: one per residue (classic fingerprint)
-    // - HNCA intra: one per residue (CA(i) + H/N)
-    // - HNCACO intra: one per residue (CO(i) + H/N)
+    // Extract assignments with backbone uniqueness constraint.
+    //
+    // Key insight: Different experiment types provide DIFFERENT information about a residue.
+    // - HSQC-15N: only H-N correlation
+    // - HNCA: H-N + CA carbon (more discriminative)
+    // - HNCACO: H-N + CO carbon (carbonyl specific)
+    //
+    // Therefore, we maintain per-experiment-type uniqueness buckets so that the SAME residue
+    // can be assigned by multiple experiment types (each providing complementary evidence).
+    // If we merged all into one bucket, only one experiment could "claim" each residue.
+    //
+    // Future: This could be generalized to per-evidence-signature buckets based on what
+    // atoms are observed, but per-experiment-type works well in practice.
     let mut assigned_hsqc_residues: HashSet<i32> = HashSet::new();
     let mut assigned_hnca_residues: HashSet<i32> = HashSet::new();
     let mut assigned_hncaco_residues: HashSet<i32> = HashSet::new();
     let mut results: Vec<ObservationAssignmentResult> = Vec::with_capacity(observations.len());
 
-    // Helper to check if an observation provides backbone H/N evidence (for debug output)
-    let is_backbone_observation = |obs: &Observation| -> bool {
-        obs.experiment_type == PeakExperimentType::Hsqc15N ||
-        (matches!(obs.experiment_type, PeakExperimentType::Hnca | PeakExperimentType::Hncaco)
-         && obs.intensity > 0.5)  // Intra peaks only
-    };
-
-    // Helper to check if an observation is a backbone intra peak (for uniqueness)
-    let is_intra_backbone = |obs: &Observation| -> bool {
-        obs.experiment_type == PeakExperimentType::Hsqc15N ||
-        (matches!(obs.experiment_type, PeakExperimentType::Hnca | PeakExperimentType::Hncaco)
-         && obs.intensity > 0.5)
+    // Helper to check if an observation is eligible for the backbone uniqueness pass.
+    // Uses physics-based check: must have intra-residue backbone H-N anchor.
+    // The experiment_type is used to route to the correct uniqueness bucket.
+    let is_intra_backbone_hn = |obs: &Observation| -> bool {
+        // Physics-based check: has backbone H-N anchor and all dimensions are intra-residue
+        obs.is_nitrogen_anchored() && obs.is_purely_intra()
     };
 
     // Sort all backbone-type peaks by confidence for greedy assignment
     let mut backbone_indices: Vec<(usize, f64)> = observations.iter().enumerate()
-        .filter(|(_, obs)| is_intra_backbone(obs))
+        .filter(|(_, obs)| is_intra_backbone_hn(obs))
         .map(|(idx, _)| {
             let best_prob = beliefs[idx].iter().skip(1).fold(0.0f64, |a, &b| a.max(b));
             (idx, best_prob)
@@ -6832,12 +7028,13 @@ pub fn run_observation_assignment(
         let belief = &beliefs[*obs_idx];
         let obs = &observations[*obs_idx];
 
-        // Get the appropriate uniqueness set for this experiment type
+        // Get the appropriate uniqueness set based on experiment type
+        // (Future: derive from atom_constraint signature instead)
         let assigned_residues = match obs.experiment_type {
             PeakExperimentType::Hsqc15N => &assigned_hsqc_residues,
             PeakExperimentType::Hnca => &assigned_hnca_residues,
             PeakExperimentType::Hncaco => &assigned_hncaco_residues,
-            _ => &assigned_hsqc_residues,  // Shouldn't happen, but default to HSQC
+            _ => &assigned_hsqc_residues,  // Default to HSQC bucket
         };
 
         // Find best available residue (not already assigned by THIS experiment type)
@@ -6920,13 +7117,9 @@ pub fn run_observation_assignment(
     if params.verbose {
         println!("\n=== BACKBONE PEAK ASSIGNMENTS ===");
         for (obs, result) in observations.iter().zip(results.iter()) {
-            if is_backbone_observation(obs) {
-                let exp_name = match obs.experiment_type {
-                    PeakExperimentType::Hsqc15N => "HSQC15N",
-                    PeakExperimentType::Hnca => "HNCA",
-                    PeakExperimentType::Hncaco => "HNCACO",
-                    _ => "OTHER",
-                };
+            if is_intra_backbone_hn(obs) {
+                // Show experiment type for debugging (still useful for humans)
+                let exp_name = format!("{:?}", obs.experiment_type);
                 let shifts: Vec<_> = obs.dimensions.iter()
                     .map(|d| format!("{:?}={:.3}", d.nucleus, d.shift))
                     .collect();

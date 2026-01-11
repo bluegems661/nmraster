@@ -5,22 +5,9 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::data::{ChemicalShift, ChemicalShiftList, Molecule, NucleusType};
-use crate::testdata::BMRBDatabase;
 use crate::error::Result;
-use crate::inference::{run_adaptive_assignment, AdaptiveToleranceParams, FactorGraph};
 use crate::state::AppState;
 
-/// Result from global assignment.
-#[derive(Debug, Serialize)]
-pub struct AssignmentResult {
-    pub atom_id: String,
-    pub atom_name: String,
-    pub residue_seq_code: i32,
-    pub residue_name: String,
-    pub assigned_shift: f64,
-    pub confidence: f64,
-    pub alternative_shifts: Vec<(f64, f64)>, // (shift, probability)
-}
 
 /// Load a molecule from sequence.
 #[tauri::command]
@@ -283,182 +270,6 @@ pub struct ShiftListInfo {
     pub num_shifts: usize,
 }
 
-/// Parameters for global assignment.
-#[derive(Debug, Deserialize)]
-pub struct AssignmentParams {
-    pub max_iterations: Option<usize>,
-    pub tolerance: Option<f64>,
-    pub include_sidechain: Option<bool>,
-}
-
-/// Run global assignment using factor graph and belief propagation.
-///
-/// This builds a factor graph from the molecule's atoms, adds BMRB priors,
-/// and incorporates observed peak positions from ALL shift lists for this molecule.
-/// Returns assignment results with confidence scores and alternatives.
-#[tauri::command]
-pub async fn run_assignment(
-    molecule_id: String,
-    _peak_list_id: Option<String>, // Deprecated: now uses all shift lists automatically
-    params: Option<AssignmentParams>,
-    state: State<'_, AppState>,
-) -> Result<Vec<AssignmentResult>> {
-    let mol_uuid = Uuid::parse_str(&molecule_id)
-        .map_err(|e| crate::error::NmrError::Internal(e.to_string()))?;
-
-    let molecule = state
-        .get_molecule(&mol_uuid)
-        .ok_or_else(|| crate::error::NmrError::Internal("Molecule not found".to_string()))?;
-
-    // Get parameters or use defaults
-    let max_iterations = params.as_ref().and_then(|p| p.max_iterations).unwrap_or(50);
-    let tolerance = params.as_ref().and_then(|p| p.tolerance).unwrap_or(1e-6);
-    let include_sidechain = params.as_ref().and_then(|p| p.include_sidechain).unwrap_or(true);
-
-    // Load comprehensive BMRB statistics (residue-specific)
-    let bmrb_db = BMRBDatabase::load_embedded();
-
-    // Build factor graph
-    let mut graph = FactorGraph::new();
-
-    // Process each residue
-    let mut atoms_added = 0;
-    let mut atoms_no_bmrb = 0;
-
-    for residue in molecule.residues() {
-        let atoms = molecule.get_atoms_for_residue(residue.sequence_code);
-
-        for atom in atoms {
-            // Skip sidechain atoms if not requested
-            let is_backbone = matches!(
-                atom.atom_name.as_str(),
-                "N" | "CA" | "C" | "O" | "H" | "HA" | "CB"
-            );
-            if !include_sidechain && !is_backbone {
-                continue;
-            }
-
-            // Create atom identifier: "residue_seq_code_atom_name"
-            let atom_id = format!("{}_{}", residue.sequence_code, atom.atom_name);
-
-            // Get residue-specific BMRB statistics
-            let stats = bmrb_db.get(&residue.residue_name, &atom.atom_name);
-
-            if let Some(stats) = stats {
-                // Create domain of possible chemical shifts
-                // 200 points gives ~0.15 ppm spacing for 30 ppm range
-                let domain = generate_shift_domain(stats.min, stats.max, 200);
-
-                // Add variable node
-                graph.add_chemical_shift_variable(&atom_id, domain);
-
-                // Add BMRB prior factor with residue-specific mean/std_dev
-                graph.add_bmrb_prior_factor(&atom_id, &atom.atom_name, stats.mean, stats.std_dev);
-                atoms_added += 1;
-            } else {
-                // Only warn for backbone atoms that should have BMRB stats
-                if matches!(atom.atom_name.as_str(), "N" | "CA" | "C" | "H" | "HA" | "CB") {
-                    tracing::warn!("No BMRB stats for {}_{} (residue {})",
-                        residue.sequence_code, atom.atom_name, residue.residue_name);
-                }
-                atoms_no_bmrb += 1;
-            }
-        }
-    }
-
-    tracing::info!("Factor graph: {} atoms added, {} skipped (no BMRB stats)",
-        atoms_added, atoms_no_bmrb);
-
-    // Add peak factors from ALL shift lists (not just one)
-    // This allows combining data from multiple experiments (HSQC, 13C-HSQC, 1H, etc.)
-    {
-        let shift_lists = state.shift_lists.read();
-        let mut total_shifts_added = 0;
-        let mut skipped_no_variable = 0;
-
-        for shift_list in shift_lists.values() {
-            // Only use shift lists for this molecule
-            if shift_list.molecule_id != mol_uuid {
-                continue;
-            }
-
-            tracing::info!("Processing shift list '{}' with {} shifts",
-                shift_list.name, shift_list.shifts.len());
-
-            for shift in &shift_list.shifts {
-                let atom_id = format!("{}_{}", shift.residue_seq_code, shift.atom_name);
-
-                // Check if variable exists (atom must be in the graph)
-                if !graph.var_indices().contains_key(&atom_id) {
-                    tracing::warn!("Skipping shift for {} (value={:.2}) - no variable in graph",
-                        atom_id, shift.value);
-                    skipped_no_variable += 1;
-                    continue;
-                }
-
-                // Compute adaptive tolerance based on domain spacing
-                // Tolerance = k * spacing, where k determines sharpness:
-                // - k = 1.0 for protons (tighter, smaller range)
-                // - k = 1.5 for carbons/nitrogens (standard)
-                // This ensures probability concentrates on nearest 1-2 domain points
-                let k = if shift.atom_name.starts_with('H') { 1.0 } else { 1.5 };
-                let tolerance = graph.get_domain_spacing(&atom_id)
-                    .map(|spacing| spacing * k)
-                    .unwrap_or(0.5);
-
-                graph.add_peak_factor(
-                    vec![atom_id.as_str()],
-                    vec![shift.value],
-                    vec![tolerance],
-                );
-                tracing::debug!("Added peak factor for {} = {:.2} ppm", atom_id, shift.value);
-                total_shifts_added += 1;
-            }
-        }
-
-        tracing::info!("Added {} peak factors from {} shift lists (skipped {} without variables)",
-            total_shifts_added, shift_lists.len(), skipped_no_variable);
-    }
-
-    // Run adaptive belief propagation with entropy-based tolerance optimization
-    let adaptive_params = AdaptiveToleranceParams {
-        target_normalized_entropy: 0.15, // Target ~15% of max entropy for good confidence
-        max_rounds: 5,
-        adjustment_factor: 0.7,  // Tighten by 30% each round
-        min_tolerance: 0.01,
-    };
-
-    let assignments = run_adaptive_assignment(&mut graph, max_iterations, tolerance, adaptive_params);
-
-    // Map to AssignmentResult with residue info
-    let results: Vec<AssignmentResult> = assignments
-        .into_iter()
-        .filter_map(|a| {
-            // Parse atom_id to get residue_seq_code and atom_name
-            let parts: Vec<&str> = a.atom_id.splitn(2, '_').collect();
-            if parts.len() != 2 {
-                return None;
-            }
-
-            let seq_code: i32 = parts[0].parse().ok()?;
-            let atom_name = parts[1].to_string();
-
-            let residue = molecule.get_residue(seq_code)?;
-
-            Some(AssignmentResult {
-                atom_id: a.atom_id,
-                atom_name,
-                residue_seq_code: seq_code,
-                residue_name: residue.residue_name.clone(),
-                assigned_shift: a.assigned_shift,
-                confidence: a.confidence,
-                alternative_shifts: a.alternatives,
-            })
-        })
-        .collect();
-
-    Ok(results)
-}
 
 // ============================================================================
 // Real Assignment (from unlabeled peaks)
@@ -597,12 +408,4 @@ pub async fn run_real_assignment(
     );
 
     Ok(results)
-}
-
-/// Generate a domain of possible chemical shift values.
-fn generate_shift_domain(min: f64, max: f64, num_points: usize) -> Vec<f64> {
-    let step = (max - min) / (num_points - 1) as f64;
-    (0..num_points)
-        .map(|i| min + i as f64 * step)
-        .collect()
 }
