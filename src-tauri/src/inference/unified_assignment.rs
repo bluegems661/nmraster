@@ -5344,15 +5344,33 @@ pub fn run_observation_assignment(
     // The old observation-level BP follows (now largely bypassed by group assignments)
     // Keep it for observations not mapped by groups
 
+    // ==========================================================================
+    // PERFORMANCE OPTIMIZATION: Precompute O(n²) operations once at max tolerance
+    // Then filter/recompute only every 5 iterations instead of every iteration
+    // ==========================================================================
+    let cached_correlation_pairs = precompute_correlation_pairs(observations, tol_params);
+    let cached_noesy_pairs = precompute_noesy_pairs(observations, tol_params);
+
+    if params.verbose {
+        println!("Cached {} correlation pairs and {} NOESY pairs at max tolerance",
+            cached_correlation_pairs.len(), cached_noesy_pairs.len());
+    }
+
+    // Mutable state for cached O(n²) results (recomputed every 5 iterations)
+    let mut current_correlation_scores: Vec<Vec<f64>> = vec![];
+    let mut current_sequential_links: Vec<ObsSequentialLink> = vec![];
+    let mut current_noesy_links: Vec<(usize, usize, f64)> = vec![];
+
+    // OPTIMIZATION: Compute typing scores ONCE before the loop
+    // The scoring function doesn't actually use iteration/tolerance parameters
+    let typing_scores = compute_observation_typing_scores(
+        observations, &residue_types, &kde, tol_params, 0, 100
+    );
+
     let max_iterations = params.max_iterations;
     for iteration in 0..max_iterations {
         let progress = iteration as f64 / max_iterations as f64;
         let interp = params.interpolate(progress);
-
-        // Compute typing scores (observation -> residue type)
-        let typing_scores = compute_observation_typing_scores(
-            observations, &residue_types, &kde, tol_params, iteration, max_iterations
-        );
 
         // DEBUG: Print type confidence for each backbone group (iteration 0 only)
         if params.verbose && iteration == 0 {
@@ -5400,10 +5418,31 @@ pub fn run_observation_assignment(
             println!("==========================================\n");
         }
 
-        // Compute correlation scores (observation <-> observation with matching shifts)
-        let correlation_scores = compute_observation_correlations(
-            observations, tol_params, iteration, max_iterations
-        );
+        // ==========================================================================
+        // OPTIMIZATION: Only recompute O(n²) operations every 5 iterations
+        // Tolerances anneal gradually, so reusing cached results is safe
+        // ==========================================================================
+        if iteration % 5 == 0 {
+            // Recompute correlations from cached pairs (O(cached) instead of O(n²))
+            current_correlation_scores = filter_correlations_from_cache(
+                &cached_correlation_pairs, observations, tol_params, iteration, max_iterations
+            );
+
+            // Recompute sequential links (O(groups²) - smaller than correlation)
+            current_sequential_links = compute_sequential_links(
+                observations, tol_params, iteration, max_iterations
+            );
+
+            // Recompute NOESY links from cached pairs
+            current_noesy_links = filter_noesy_from_cache(
+                &cached_noesy_pairs, tol_params, iteration, max_iterations
+            );
+        }
+
+        // Use current cached values (alias for readability)
+        let correlation_scores = &current_correlation_scores;
+        let sequential_links = &current_sequential_links;
+        let noesy_links = &current_noesy_links;
 
         // DEBUG: Count significant correlations (iteration 0 only)
         if params.verbose && iteration == 0 {
@@ -5420,11 +5459,6 @@ pub fn run_observation_assignment(
             println!("Correlations: {} pairs with strength > 0.01, avg={:.3}",
                 n_correlations, if n_correlations > 0 { total_strength / n_correlations as f64 } else { 0.0 });
         }
-
-        // Compute sequential relationships from triple-resonance carbon matching
-        let sequential_links = compute_sequential_links(
-            observations, tol_params, iteration, max_iterations
-        );
 
         // Debug: Print sequential links info (first iteration only)
         if params.verbose && iteration == 0 {
@@ -5447,11 +5481,6 @@ pub fn run_observation_assignment(
             println!("Unique backbone group pairs: {}", backbone_pairs.len());
             println!("========================\n");
         }
-
-        // Compute NOESY backbone-carbon correlations (Factor 3)
-        let noesy_links = compute_noesy_backbone_carbon(
-            observations, tol_params, iteration, max_iterations
-        );
 
         // Message passing update with both same-residue and sequential factors
         // Now includes Factor 3 (NOESY sequential) and Factor 5 (sequence-type constraint)
@@ -6874,6 +6903,181 @@ struct ObsSequentialLink {
     from_idx: usize,  // Observation index that is at position i
     to_idx: usize,    // Observation index that is at position i+1
     strength: f64,    // Carbon match quality (0-1)
+}
+
+// =============================================================================
+// CACHED O(n²) STRUCTURES - Precomputed at max tolerance for fast iteration
+// =============================================================================
+
+/// Cached correlation pair - stores indices of observations that correlate at max tolerance.
+/// Used to avoid O(n²) recomputation every iteration.
+#[derive(Debug, Clone)]
+struct CachedCorrelationPair {
+    i: usize,
+    j: usize,
+}
+
+/// Cached sequential link data - stores backbone group indices and their carbon shift diffs.
+/// Allows filtering by current tolerance without recomputing O(n²) backbone grouping.
+#[derive(Debug, Clone)]
+struct CachedSequentialData {
+    from_group_idx: usize,
+    to_group_idx: usize,
+    // Carbon shift diffs (stored for filtering) - None means no data for that atom
+    ca_diff: Option<f64>,  // |inter_CA_from - intra_CA_to|
+    cb_diff: Option<f64>,  // |inter_CB_from - intra_CB_to|
+    co_diff: Option<f64>,  // |inter_CO_from - intra_CO_to|
+    // Observation indices to propagate links to
+    from_obs_indices: Vec<usize>,
+    to_obs_indices: Vec<usize>,
+}
+
+/// Cached NOESY link data - stores proton shift diff for fast filtering.
+#[derive(Debug, Clone)]
+struct CachedNoesyPair {
+    backbone_idx: usize,
+    carbon_idx: usize,
+    h_diff: f64,  // |H_backbone - H_carbon|
+}
+
+// =============================================================================
+// PRECOMPUTE AND FILTER FUNCTIONS - O(n²) once, O(cached) per iteration
+// =============================================================================
+
+/// Precompute correlation pairs at max tolerance (iteration 0).
+/// Returns pairs that correlate at the widest tolerance - these are candidates for all iterations.
+fn precompute_correlation_pairs(
+    observations: &[Observation],
+    tol_params: &NucleusToleranceParams,
+) -> Vec<CachedCorrelationPair> {
+    let n = observations.len();
+    let mut pairs = Vec::new();
+
+    // Use iteration=0 for max (widest) tolerance
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let score = compute_observation_pair_correlation(
+                &observations[i], &observations[j],
+                tol_params, 0, 100
+            );
+            if score > 0.01 {
+                pairs.push(CachedCorrelationPair { i, j });
+            }
+        }
+    }
+
+    pairs
+}
+
+/// Filter correlations from cached pairs using current tolerance.
+/// Much faster than O(n²) - only iterates over pre-computed candidate pairs.
+fn filter_correlations_from_cache(
+    cached_pairs: &[CachedCorrelationPair],
+    observations: &[Observation],
+    tol_params: &NucleusToleranceParams,
+    iteration: usize,
+    max_iterations: usize,
+) -> Vec<Vec<f64>> {
+    let n = observations.len();
+    let mut correlations = vec![vec![0.0; n]; n];
+
+    // Self-correlations
+    for i in 0..n {
+        correlations[i][i] = 1.0;
+    }
+
+    // Only compute for cached pairs
+    for pair in cached_pairs {
+        let score = compute_observation_pair_correlation(
+            &observations[pair.i], &observations[pair.j],
+            tol_params, iteration, max_iterations
+        );
+        correlations[pair.i][pair.j] = score;
+        correlations[pair.j][pair.i] = score;
+    }
+
+    correlations
+}
+
+/// Precompute NOESY backbone-carbon pairs at max tolerance.
+fn precompute_noesy_pairs(
+    observations: &[Observation],
+    tol_params: &NucleusToleranceParams,
+) -> Vec<CachedNoesyPair> {
+    use crate::data::spin_system::TransferPathway;
+
+    let h_max_tol = tol_params.tolerance_for(NucleusType::H1, 0, 100);
+    let mut pairs = Vec::new();
+
+    // Helper to check if observation is backbone-type (has H/N)
+    let is_backbone = |obs: &Observation| -> bool {
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::H1) &&
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::N15)
+    };
+
+    // Helper to check if observation is carbon-type with NOESY pathway
+    let is_noesy_carbon = |obs: &Observation| -> bool {
+        obs.transfer_pathway == TransferPathway::ThroughSpace &&
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::H1) &&
+        obs.dimensions.iter().any(|d| d.nucleus == NucleusType::C13)
+    };
+
+    // Get H shift from observation
+    let get_h = |obs: &Observation| -> Option<f64> {
+        obs.dimensions.iter()
+            .find(|d| d.nucleus == NucleusType::H1)
+            .map(|d| d.shift)
+    };
+
+    // Find backbone and NOESY carbon observations
+    let backbone_obs: Vec<(usize, f64)> = observations.iter()
+        .enumerate()
+        .filter(|(_, obs)| is_backbone(obs))
+        .filter_map(|(idx, obs)| get_h(obs).map(|h| (idx, h)))
+        .collect();
+
+    let noesy_carbon_obs: Vec<(usize, f64)> = observations.iter()
+        .enumerate()
+        .filter(|(_, obs)| is_noesy_carbon(obs))
+        .filter_map(|(idx, obs)| get_h(obs).map(|h| (idx, h)))
+        .collect();
+
+    // Find pairs that match at max tolerance
+    for (bb_idx, bb_h) in &backbone_obs {
+        for (c_idx, c_h) in &noesy_carbon_obs {
+            let h_diff = (bb_h - c_h).abs();
+            if h_diff < h_max_tol {
+                pairs.push(CachedNoesyPair {
+                    backbone_idx: *bb_idx,
+                    carbon_idx: *c_idx,
+                    h_diff,
+                });
+            }
+        }
+    }
+
+    pairs
+}
+
+/// Filter NOESY links from cached pairs using current tolerance.
+fn filter_noesy_from_cache(
+    cached_pairs: &[CachedNoesyPair],
+    tol_params: &NucleusToleranceParams,
+    iteration: usize,
+    max_iterations: usize,
+) -> Vec<(usize, usize, f64)> {
+    let h_tol = tol_params.tolerance_for(NucleusType::H1, iteration, max_iterations);
+    let mut links = Vec::new();
+
+    for pair in cached_pairs {
+        if pair.h_diff < h_tol {
+            // Quality based on Gaussian
+            let quality = (-0.5 * (pair.h_diff / h_tol).powi(2)).exp();
+            links.push((pair.backbone_idx, pair.carbon_idx, quality));
+        }
+    }
+
+    links
 }
 
 /// Compute sequential links from backbone-sequential transfer pathway observations.
