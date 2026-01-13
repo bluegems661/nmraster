@@ -844,6 +844,16 @@ fn run_bmrb_mode(entry_id: u32, residue_range: Option<String>, output_json: Opti
             observations.push(obs);
         }
     }
+    for peak in &hbcbcgcdhd {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hbcbcgcdcehe {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
 
     println!("Total observations: {}", observations.len());
 
@@ -1045,6 +1055,16 @@ fn run_synthetic_mode(sequence: &str, noise: f64, verbose: bool, filter: &Experi
         }
     }
     for peak in &hsqc_tocsy_13c_3d {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hbcbcgcdhd {
+        if let Some(obs) = Observation::from_unlabeled_peak(peak) {
+            observations.push(obs);
+        }
+    }
+    for peak in &hbcbcgcdcehe {
         if let Some(obs) = Observation::from_unlabeled_peak(peak) {
             observations.push(obs);
         }
@@ -2998,6 +3018,22 @@ fn map_nucleus_to_atom(nucleus: &str, atom_desc: &str) -> String {
                     // Strip "(i-1)" suffix if present
                     s.trim_end_matches("(i-1)").to_string()
                 })
+                .unwrap_or_else(|| nucleus.to_string())
+        }
+        "HD" => {
+            // Aromatic delta proton - extract specific atom from atom_desc
+            // Examples: "CB/HD1" -> "HD1", "CB/HD2" -> "HD2"
+            parts.iter()
+                .find(|p| p.starts_with("HD"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| nucleus.to_string())
+        }
+        "HE" => {
+            // Aromatic epsilon proton - extract specific atom from atom_desc
+            // Examples: "CB/HE1" -> "HE1", "CB/HE2" -> "HE2", "CB/HE3" -> "HE3"
+            parts.iter()
+                .find(|p| p.starts_with("HE"))
+                .map(|s| s.to_string())
                 .unwrap_or_else(|| nucleus.to_string())
         }
         _ => nucleus.to_string()
