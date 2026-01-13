@@ -1777,10 +1777,22 @@ fn compute_mahalanobis_distance(
 }
 
 /// Find unique backbone (H, N) centers from observations using Mahalanobis distance.
+/// Compute centroid of cluster members (helper for deterministic clustering)
+fn compute_cluster_centroid(pairs: &[(f64, f64)], member_indices: &[usize]) -> (f64, f64) {
+    let n = member_indices.len() as f64;
+    let sum_h: f64 = member_indices.iter().map(|&i| pairs[i].0).sum();
+    let sum_n: f64 = member_indices.iter().map(|&i| pairs[i].1).sum();
+    (sum_h / n, sum_n / n)
+}
+
+/// Find unique backbone (H, N) centers using Mahalanobis distance clustering.
 /// Uses covariance-aware clustering to identify distinct spin systems.
 ///
-/// CRYSTALLINE-compatible: This performs density peak detection - each center
-/// represents a local maximum in the (H, N) density field.
+/// DETERMINISTIC: Results are independent of input observation order.
+/// This is achieved by:
+/// 1. Sorting (H, N) pairs before clustering
+/// 2. Assigning to nearest centroid (not first match)
+/// 3. Computing final centers as cluster averages
 fn find_backbone_centers_mahalanobis(
     observations: &[Observation],
     backbone_indices: &[usize],
@@ -1788,47 +1800,114 @@ fn find_backbone_centers_mahalanobis(
     sigma_n: f64,         // N measurement uncertainty (e.g., 0.15 ppm)
     d_mahal_threshold: f64,  // Merge if d_mahal < threshold (e.g., 2.0 for 2-sigma)
 ) -> Vec<(f64, f64)> {
-    let mut centers: Vec<(f64, f64)> = Vec::new();
+    // 1. Extract all (H, N) pairs from backbone observations
+    let mut hn_pairs: Vec<(f64, f64)> = backbone_indices
+        .iter()
+        .filter_map(|&idx| get_backbone_hn_from_obs(&observations[idx]))
+        .collect();
 
-    for &idx in backbone_indices {
-        let Some((h, n)) = get_backbone_hn_from_obs(&observations[idx]) else { continue };
+    if hn_pairs.is_empty() {
+        return Vec::new();
+    }
 
-        // Check if this (H, N) matches any existing center using Mahalanobis distance
-        let matches_existing = centers.iter().any(|(h_c, n_c)| {
-            compute_mahalanobis_distance(h, n, *h_c, *n_c, sigma_h, sigma_n) < d_mahal_threshold
-        });
+    // 2. Sort pairs for deterministic iteration (by H first, then N)
+    hn_pairs.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
-        if !matches_existing {
-            centers.push((h, n));
+    // 3. Assign each pair to a cluster (greedy, but deterministic due to sorting)
+    let mut cluster_members: Vec<Vec<usize>> = Vec::new();
+
+    for (i, &(h, n)) in hn_pairs.iter().enumerate() {
+        // Find existing cluster within threshold (using centroid distance)
+        let mut best_cluster: Option<usize> = None;
+        let mut best_dist = d_mahal_threshold;
+
+        for (cluster_idx, members) in cluster_members.iter().enumerate() {
+            // Compute distance to cluster centroid
+            let (c_h, c_n) = compute_cluster_centroid(&hn_pairs, members);
+            let dist = compute_mahalanobis_distance(h, n, c_h, c_n, sigma_h, sigma_n);
+            if dist < best_dist {
+                best_dist = dist;
+                best_cluster = Some(cluster_idx);
+            }
+        }
+
+        match best_cluster {
+            Some(cluster_idx) => {
+                cluster_members[cluster_idx].push(i);
+            }
+            None => {
+                // Create new cluster
+                cluster_members.push(vec![i]);
+            }
         }
     }
 
-    centers
+    // 4. Compute final centers as cluster centroids (order-independent)
+    cluster_members
+        .iter()
+        .map(|members| compute_cluster_centroid(&hn_pairs, members))
+        .collect()
 }
 
 /// Legacy function for backward compatibility - uses hard rectangular tolerance
+/// DETERMINISTIC: Results are independent of input observation order.
 fn find_backbone_centers(
     observations: &[Observation],
     backbone_indices: &[usize],
     h_tolerance: f64,
     n_tolerance: f64,
 ) -> Vec<(f64, f64)> {
-    let mut centers: Vec<(f64, f64)> = Vec::new();
+    // 1. Extract all (H, N) pairs from backbone observations
+    let mut hn_pairs: Vec<(f64, f64)> = backbone_indices
+        .iter()
+        .filter_map(|&idx| get_backbone_hn_from_obs(&observations[idx]))
+        .collect();
 
-    for &idx in backbone_indices {
-        let Some((h, n)) = get_backbone_hn_from_obs(&observations[idx]) else { continue };
+    if hn_pairs.is_empty() {
+        return Vec::new();
+    }
 
-        // Check if this (H, N) matches any existing center
-        let matches_existing = centers.iter().any(|(h_c, n_c)| {
-            (h - h_c).abs() < h_tolerance && (n - n_c).abs() < n_tolerance
-        });
+    // 2. Sort pairs for deterministic iteration (by H first, then N)
+    hn_pairs.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
-        if !matches_existing {
-            centers.push((h, n));
+    // 3. Assign each pair to a cluster (greedy, but deterministic due to sorting)
+    let mut cluster_members: Vec<Vec<usize>> = Vec::new();
+
+    for (i, &(h, n)) in hn_pairs.iter().enumerate() {
+        // Find existing cluster within tolerance (using centroid distance)
+        let mut best_cluster: Option<usize> = None;
+
+        for (cluster_idx, members) in cluster_members.iter().enumerate() {
+            let (c_h, c_n) = compute_cluster_centroid(&hn_pairs, members);
+            if (h - c_h).abs() < h_tolerance && (n - c_n).abs() < n_tolerance {
+                best_cluster = Some(cluster_idx);
+                break; // Take first match for rectangular tolerance
+            }
+        }
+
+        match best_cluster {
+            Some(cluster_idx) => {
+                cluster_members[cluster_idx].push(i);
+            }
+            None => {
+                cluster_members.push(vec![i]);
+            }
         }
     }
 
-    centers
+    // 4. Compute final centers as cluster centroids
+    cluster_members
+        .iter()
+        .map(|members| compute_cluster_centroid(&hn_pairs, members))
+        .collect()
 }
 
 /// Create soft backbone groups with weighted observation contributions.
@@ -2927,6 +3006,13 @@ fn is_confident_ala(typing_scores: &[f64], residue_types: &[String]) -> bool {
 }
 
 /// Compute typing scores for each group based on evidence.
+///
+/// UNIFIED JOINT SCORING: Collects ALL observed shifts (H, N, CA, CB, HA, HB, etc.)
+/// and scores them together in ONE product of KDE densities. Each atom contributes
+/// exactly ONCE regardless of how many observations provided it.
+///
+/// P(residue_type | shifts) ∝ ∏ KDE(atom_shift | residue_type, atom)
+///
 fn compute_group_typing_scores(
     groups: &[SpinSystemEvidence],
     residue_types: &[String],
@@ -2937,80 +3023,87 @@ fn compute_group_typing_scores(
     groups.iter().map(|group| {
         let mut scores = vec![1.0; n_positions];
 
-        // CRITICAL: Groups with backbone H/N CANNOT be prolines
-        // Prolines have no amide proton, so any backbone group with H/N shifts
-        // should have ZERO probability for proline positions
-        let has_backbone_hn = group.h_shift > 0.0 && group.n_shift > 0.0;
+        // Collect ALL intra-residue shifts into one map: atom_name -> shift
+        // Each atom contributes exactly ONCE (HashMap ensures deduplication)
+        let mut all_shifts: HashMap<String, f64> = HashMap::new();
+
+        // Backbone H and N
+        if group.h_shift > 0.0 {
+            all_shifts.insert("H".to_string(), group.h_shift);
+        }
+        if group.n_shift > 0.0 {
+            all_shifts.insert("N".to_string(), group.n_shift);
+        }
+
+        // Carbons: CA, CB, C', CG, etc.
+        for (atom, &shift) in &group.intra_carbons {
+            all_shifts.insert(atom.clone(), shift);
+        }
+
+        // Sidechain protons: HA, HB, HG, etc.
+        for (atom, &shift) in &group.intra_protons {
+            all_shifts.insert(atom.clone(), shift);
+        }
+
+        // Hard constraints based on what we observed
+        let has_backbone_hn = all_shifts.contains_key("H") && all_shifts.contains_key("N");
+        let has_cb = all_shifts.contains_key("CB");
 
         for (pos, res_type) in residue_types.iter().enumerate() {
-            // Proline exclusion: if we have H/N, proline is impossible
+            // HARD CONSTRAINT: Groups with backbone H/N CANNOT be prolines
+            // Prolines have no amide proton (it's an imino acid)
             if has_backbone_hn && res_type == "PRO" {
-                scores[pos] = 1e-20;  // Essentially zero
+                scores[pos] = 1e-20;
                 continue;
             }
 
-            // N-terminus (position 1) exclusion: no backbone amide
-            // Position 1 has -NH3+ (amino terminus), not -NH- (amide)
+            // HARD CONSTRAINT: N-terminus (position 0) has no backbone amide
+            // Position 0 has -NH3+ (amino terminus), not -NH- (amide)
             if has_backbone_hn && pos == 0 {
                 scores[pos] = 1e-20;
                 continue;
             }
 
-            let mut score = 1.0;
+            // HARD CONSTRAINT: GLY has no CB - if we see CB, it's not glycine
+            if has_cb && res_type == "GLY" {
+                scores[pos] = 1e-20;
+                continue;
+            }
 
-            // 1. Carbon contributions (CA, CB, C')
-            // CRITICAL: If we observe an atom (like CB) that the residue type shouldn't have,
-            // that's STRONG evidence AGAINST this residue type (e.g., GLY has no CB)
-            for (atom, &shift) in &group.intra_carbons {
-                let density = kde.density(res_type, atom, shift);
+            // UNIFIED SCORING: Product of KDE densities for ALL observed atoms
+            // Each atom contributes exactly once to the joint probability
+            let mut log_score = 0.0;
+
+            for (atom, &shift) in &all_shifts {
+                let density = get_atom_kde_density(kde, res_type, atom, shift);
+
                 if density > 0.0 {
-                    score *= density.max(1e-10);
+                    log_score += density.ln();
                 } else {
-                    // Zero density means this residue type doesn't have this atom
-                    // This is strong negative evidence (e.g., GLY-CB = 0)
-                    score *= 1e-15;  // Severe penalty
+                    // Zero density = this residue type doesn't have this atom
+                    // Strong negative evidence (but not as harsh as hard constraint)
+                    log_score += -30.0;  // ln(1e-13) ≈ -30
                 }
             }
 
-            // 2. Backbone (H, N) contribution - use product of marginals
-            // TODO: Add bivariate KDE for (H, N) pairs for better discrimination
-            if group.h_shift > 0.0 && group.n_shift > 0.0 {
-                let h_density = kde.density(res_type, "H", group.h_shift);
-                let n_density = kde.density(res_type, "N", group.n_shift);
-                if h_density > 0.0 && n_density > 0.0 {
-                    score *= (h_density * n_density).max(1e-10);
-                }
-            }
-
-            // 3. Intra-residue sidechain protons (if available)
-            for (atom, &shift) in &group.intra_protons {
-                let density = kde.density(res_type, atom, shift);
-                if density > 0.0 {
-                    score *= density.max(1e-10);
-                }
-            }
-
-            // 4. Inter-residue protons from HBHACONH: HA(i-1), HB(i-1)
-            // These should be scored against the PRECEDING residue type
+            // Inter-residue protons (HBHACONH): score against PRECEDING residue
+            // These constrain the (i-1) position, not the current position
             if !group.inter_protons.is_empty() && pos > 0 {
                 let prev_res_type = &residue_types[pos - 1];
                 for (atom, &shift) in &group.inter_protons {
-                    // Try multiple atom variants (GLY has HA2/HA3, not HA)
-                    let density = proton_kde_density(kde, prev_res_type, atom, shift);
+                    let density = get_atom_kde_density(kde, prev_res_type, atom, shift);
                     if density > 0.0 {
-                        score *= density.max(1e-10);
+                        log_score += density.ln();
                     } else {
-                        // Penalty if preceding residue doesn't have this atom
-                        // (e.g., GLY has no HB)
-                        score *= 1e-10;
+                        log_score += -20.0;  // ln(1e-9) ≈ -20 (softer for inter)
                     }
                 }
             }
 
-            scores[pos] = score;
+            scores[pos] = log_score.exp();
         }
 
-        // Normalize scores
+        // Normalize to probabilities
         let sum: f64 = scores.iter().sum();
         if sum > 0.0 {
             for s in scores.iter_mut() {
@@ -3022,10 +3115,10 @@ fn compute_group_typing_scores(
     }).collect()
 }
 
-/// Get KDE density for a proton, trying multiple stereospecific variants.
-/// GLY has HA2/HA3 instead of HA, most residues have HB2/HB3 instead of HB.
-fn proton_kde_density(kde: &KDEDatabase, res_type: &str, atom: &str, shift: f64) -> f64 {
-    // First try the exact atom name
+/// Get KDE density for an atom, handling stereospecific naming variants.
+/// Tries exact name first, then common variants (HA -> HA2/HA3 for GLY, etc.)
+fn get_atom_kde_density(kde: &KDEDatabase, res_type: &str, atom: &str, shift: f64) -> f64 {
+    // Try exact atom name first
     let direct = kde.density(res_type, atom, shift);
     if direct > 0.0 {
         return direct;
@@ -3034,22 +3127,30 @@ fn proton_kde_density(kde: &KDEDatabase, res_type: &str, atom: &str, shift: f64)
     // Try stereospecific variants
     match atom {
         "HA" => {
-            // Try HA2, HA3 (for GLY)
-            let d2 = kde.density(res_type, "HA2", shift);
-            let d3 = kde.density(res_type, "HA3", shift);
-            // Return best match
-            d2.max(d3)
+            // GLY has HA2/HA3 instead of HA
+            kde.density(res_type, "HA2", shift)
+                .max(kde.density(res_type, "HA3", shift))
         }
         "HB" => {
-            // Try HB1, HB2, HB3 (for different residues)
-            let d1 = kde.density(res_type, "HB1", shift);
-            let d2 = kde.density(res_type, "HB2", shift);
-            let d3 = kde.density(res_type, "HB3", shift);
-            d1.max(d2).max(d3)
+            // Many residues have HB2/HB3 instead of single HB
+            kde.density(res_type, "HB", shift)
+                .max(kde.density(res_type, "HB2", shift))
+                .max(kde.density(res_type, "HB3", shift))
+        }
+        "HG" => {
+            kde.density(res_type, "HG", shift)
+                .max(kde.density(res_type, "HG2", shift))
+                .max(kde.density(res_type, "HG3", shift))
+        }
+        "HD" => {
+            kde.density(res_type, "HD1", shift)
+                .max(kde.density(res_type, "HD2", shift))
+                .max(kde.density(res_type, "HD3", shift))
         }
         _ => 0.0
     }
 }
+
 
 /// Extract unique assignments from beliefs using greedy approach.
 fn extract_group_assignments(
