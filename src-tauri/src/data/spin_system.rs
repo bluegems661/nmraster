@@ -42,6 +42,10 @@ pub enum PeakExperimentType {
     Cbcaconh,
     /// HBHACONH: (H, N, HA/HB) - correlates NH(i) with HA/HB(i-1) only
     Hbhaconh,
+    /// (HB)CB(CGCD)HD: 2D correlating CB with aromatic HD protons
+    HbCbCgCdHd,
+    /// (HB)CB(CGCDCE)HE: 2D correlating CB with aromatic HE protons
+    HbCbCgCdCeHe,
 }
 
 // ============================================================================
@@ -247,6 +251,18 @@ impl UnlabeledPeak {
         Self::new(vec![h_ppm, n_ppm, h_ali_ppm], intensity, PeakExperimentType::Hbhaconh)
     }
 
+    /// Create an (HB)CB(CGCD)HD peak (CB, HD).
+    /// Correlates CB with aromatic HD protons for PHE, TYR, TRP, HIS.
+    pub fn hbcbcgcdhd(cb_ppm: f64, hd_ppm: f64, intensity: f64) -> Self {
+        Self::new(vec![cb_ppm, hd_ppm], intensity, PeakExperimentType::HbCbCgCdHd)
+    }
+
+    /// Create an (HB)CB(CGCDCE)HE peak (CB, HE).
+    /// Correlates CB with aromatic HE protons for PHE, TYR, TRP.
+    pub fn hbcbcgcdcehe(cb_ppm: f64, he_ppm: f64, intensity: f64) -> Self {
+        Self::new(vec![cb_ppm, he_ppm], intensity, PeakExperimentType::HbCbCgCdCeHe)
+    }
+
     /// Get chemical shifts with nucleus labels based on experiment type.
     /// Returns [(nucleus_name, shift_ppm), ...]
     pub fn get_shifts_labeled(&self) -> Vec<(String, f64)> {
@@ -362,6 +378,20 @@ impl UnlabeledPeak {
                     ("H".to_string(), self.position_ppm.get(0).copied().unwrap_or(0.0)),
                     ("N".to_string(), self.position_ppm.get(1).copied().unwrap_or(0.0)),
                     ("H_ali".to_string(), self.position_ppm.get(2).copied().unwrap_or(0.0)),
+                ]
+            }
+            PeakExperimentType::HbCbCgCdHd => {
+                // [CB, HD]
+                vec![
+                    ("CB".to_string(), self.position_ppm.get(0).copied().unwrap_or(0.0)),
+                    ("HD".to_string(), self.position_ppm.get(1).copied().unwrap_or(0.0)),
+                ]
+            }
+            PeakExperimentType::HbCbCgCdCeHe => {
+                // [CB, HE]
+                vec![
+                    ("CB".to_string(), self.position_ppm.get(0).copied().unwrap_or(0.0)),
+                    ("HE".to_string(), self.position_ppm.get(1).copied().unwrap_or(0.0)),
                 ]
             }
         }

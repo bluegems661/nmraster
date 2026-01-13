@@ -572,6 +572,51 @@ impl Observation {
                 ];
                 (dims, TransferPathway::ThroughBond, false)
             }
+
+            // === AROMATIC SIDECHAIN: CB to aromatic proton correlations ===
+            // Multi-bond J-coupling through aromatic ring. Both nuclei at same residue.
+
+            HbCbCgCdHd => {
+                // (HB)CB(CGCD)HD: CB correlated with aromatic HD protons
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("CB".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("CB".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("HD".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::OneOf(vec!["HD1".into(), "HD2".into()]),
+                    },
+                ];
+                (dims, TransferPathway::ThroughBond, false)
+            }
+
+            HbCbCgCdCeHe => {
+                // (HB)CB(CGCDCE)HE: CB correlated with aromatic HE protons
+                let dims = vec![
+                    ObservedDimension {
+                        nucleus: NucleusType::C13,
+                        shift: peak.position_ppm[0],
+                        atom_hint: Some("CB".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::Exact("CB".to_string()),
+                    },
+                    ObservedDimension {
+                        nucleus: NucleusType::H1,
+                        shift: peak.position_ppm[1],
+                        atom_hint: Some("HE".to_string()),
+                        residue_offset: ResidueOffset::Intra,
+                        atom_constraint: AtomConstraint::OneOf(vec!["HE1".into(), "HE2".into(), "HE3".into()]),
+                    },
+                ];
+                (dims, TransferPathway::ThroughBond, false)
+            }
         };
 
         Some(Self {

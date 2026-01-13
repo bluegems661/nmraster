@@ -55,13 +55,15 @@ struct Cli {
 
     /// Exclude specific experiment types (comma-separated).
     /// Options: 15n-hsqc, 13c-hsqc, tocsy, noesy, hsqc-tocsy-15n, hsqc-tocsy-13c,
-    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh
+    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh,
+    ///          hbcbcgcdhd, hbcbcgcdcehe
     #[arg(long, global = true, conflicts_with = "only")]
     exclude: Option<String>,
 
     /// Only use specific experiment types (comma-separated).
     /// Options: 15n-hsqc, 13c-hsqc, tocsy, noesy, hsqc-tocsy-15n, hsqc-tocsy-13c,
-    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh
+    ///          hsqc-tocsy-15n-3d, hsqc-tocsy-13c-3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh,
+    ///          hbcbcgcdhd, hbcbcgcdcehe
     #[arg(long, global = true, conflicts_with = "exclude")]
     only: Option<String>,
 }
@@ -740,7 +742,7 @@ fn run_bmrb_mode(entry_id: u32, residue_range: Option<String>, output_json: Opti
     print_data_density(&shifts, &sequence);
 
     // Generate peaks from deposited shifts
-    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, hbcbcgcdhd, hbcbcgcdcehe, ground_truth) =
         generate_peaks_from_bmrb(&shifts, filter);
 
     println!(
@@ -762,6 +764,11 @@ fn run_bmrb_mode(entry_id: u32, residue_range: Option<String>, output_json: Opti
         hncacb.len(),
         cbcaconh.len(),
         hbhaconh.len()
+    );
+    println!(
+        "Aromatic peaks: {} (HB)CB(CGCD)HD, {} (HB)CB(CGCDCE)HE",
+        hbcbcgcdhd.len(),
+        hbcbcgcdcehe.len()
     );
 
     // UNIFIED OBSERVATION MODEL: Convert ALL peaks to observations
@@ -940,7 +947,7 @@ fn run_synthetic_mode(sequence: &str, noise: f64, verbose: bool, filter: &Experi
     let kde = KDEDatabase::load_embedded();
 
     // Generate peaks from KDE modes
-    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+    let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, hbcbcgcdhd, hbcbcgcdcehe, ground_truth) =
         generate_synthetic_peaks(sequence, &kde, noise, filter);
 
     println!(
@@ -962,6 +969,11 @@ fn run_synthetic_mode(sequence: &str, noise: f64, verbose: bool, filter: &Experi
         hncacb.len(),
         cbcaconh.len(),
         hbhaconh.len()
+    );
+    println!(
+        "Aromatic peaks: {} (HB)CB(CGCD)HD, {} (HB)CB(CGCDCE)HE",
+        hbcbcgcdhd.len(),
+        hbcbcgcdcehe.len()
     );
 
     // UNIFIED OBSERVATION MODEL: Convert ALL peaks to observations
@@ -1080,6 +1092,8 @@ fn generate_peaks_from_bmrb(
     Vec<UnlabeledPeak>,  // hncacb
     Vec<UnlabeledPeak>,  // cbcaconh
     Vec<UnlabeledPeak>,  // hbhaconh
+    Vec<UnlabeledPeak>,  // hbcbcgcdhd
+    Vec<UnlabeledPeak>,  // hbcbcgcdcehe
     GroundTruth,
 ) {
     let mut hsqc_15n = Vec::new();
@@ -1096,6 +1110,8 @@ fn generate_peaks_from_bmrb(
     let mut hncacb = Vec::new();
     let mut cbcaconh = Vec::new();
     let mut hbhaconh = Vec::new();
+    let mut hbcbcgcdhd = Vec::new();
+    let mut hbcbcgcdcehe = Vec::new();
     // Group shifts by residue
     let mut by_residue: HashMap<i32, Vec<&DepositedShift>> = HashMap::new();
     for shift in shifts {
@@ -1174,6 +1190,39 @@ fn generate_peaks_from_bmrb(
                             ground_truth.register(&peak, seq_code, &atom_desc);
                             hsqc_13c.push(peak);
                         }
+                    }
+                }
+            }
+        }
+
+        // (HB)CB(CGCD)HD: CB to HD correlation for aromatic residues
+        if filter.should_include("hbcbcgcdhd") {
+            if let Some(cb_shift) = res_shifts.iter().find(|s| s.atom_name == "CB") {
+                // PHE, TYR: HD1/HD2 (symmetric, fast exchange)
+                // TRP: HD1 only (asymmetric indole)
+                // HIS: HD2 only
+                for hd_name in &["HD1", "HD2"] {
+                    if let Some(hd_shift) = res_shifts.iter().find(|s| s.atom_name == *hd_name) {
+                        let peak = UnlabeledPeak::hbcbcgcdhd(cb_shift.shift_value, hd_shift.shift_value, 1.0);
+                        let atom_desc = format!("CB/{}", hd_name);
+                        ground_truth.register(&peak, seq_code, &atom_desc);
+                        hbcbcgcdhd.push(peak);
+                    }
+                }
+            }
+        }
+
+        // (HB)CB(CGCDCE)HE: CB to HE correlation for aromatic residues
+        if filter.should_include("hbcbcgcdcehe") {
+            if let Some(cb_shift) = res_shifts.iter().find(|s| s.atom_name == "CB") {
+                // PHE, TYR: HE1/HE2 (symmetric, fast exchange)
+                // TRP: HE3 (aromatic ring), HE1 is NHε (different experiment)
+                for he_name in &["HE1", "HE2", "HE3"] {
+                    if let Some(he_shift) = res_shifts.iter().find(|s| s.atom_name == *he_name) {
+                        let peak = UnlabeledPeak::hbcbcgcdcehe(cb_shift.shift_value, he_shift.shift_value, 1.0);
+                        let atom_desc = format!("CB/{}", he_name);
+                        ground_truth.register(&peak, seq_code, &atom_desc);
+                        hbcbcgcdcehe.push(peak);
                     }
                 }
             }
@@ -1544,7 +1593,7 @@ fn generate_peaks_from_bmrb(
         }
     }
 
-    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth)
+    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, hbcbcgcdhd, hbcbcgcdcehe, ground_truth)
 }
 
 /// Generate synthetic peaks from KDE modes
@@ -1569,6 +1618,8 @@ fn generate_synthetic_peaks(
     Vec<UnlabeledPeak>,  // hncacb
     Vec<UnlabeledPeak>,  // cbcaconh
     Vec<UnlabeledPeak>,  // hbhaconh
+    Vec<UnlabeledPeak>,  // hbcbcgcdhd
+    Vec<UnlabeledPeak>,  // hbcbcgcdcehe
     GroundTruth,
 ) {
     use rand::Rng;
@@ -1588,6 +1639,8 @@ fn generate_synthetic_peaks(
     let mut hncacb = Vec::new();
     let mut cbcaconh = Vec::new();
     let mut hbhaconh = Vec::new();
+    let mut hbcbcgcdhd = Vec::new();
+    let mut hbcbcgcdcehe = Vec::new();
     let mut ground_truth = GroundTruth::new(sequence);
 
     // Carbon-proton pairs for 13C-HSQC (same as BMRB mode)
@@ -1802,6 +1855,46 @@ fn generate_synthetic_peaks(
                         if !entry.iter().any(|(name, _, _)| name == *proton_name) {
                             entry.push((proton_name.to_string(), h_shift, h_mode));
                         }
+                    }
+                }
+            }
+        }
+
+        // (HB)CB(CGCD)HD: CB to HD correlation for aromatic residues
+        if filter.should_include("hbcbcgcdhd") {
+            if let Some(&cb_shift) = cb_shifts.get(&seq_code) {
+                let cb_ref = cb_refs.get(&seq_code).copied().unwrap_or(cb_shift);
+                for hd_name in &["HD1", "HD2"] {
+                    // Find HD in residue_protons
+                    if let Some((_, hd_shift, hd_ref)) = residue_protons.iter().find(|(name, _, _)| name == *hd_name) {
+                        let peak = UnlabeledPeak::hbcbcgcdhd(cb_shift, *hd_shift, 1.0);
+                        let atom_desc = format!("CB/{}", hd_name);
+                        let reference = vec![
+                            ("CB".to_string(), cb_ref),
+                            ("HD".to_string(), *hd_ref),
+                        ];
+                        ground_truth.register_with_reference(&peak, seq_code, &atom_desc, reference);
+                        hbcbcgcdhd.push(peak);
+                    }
+                }
+            }
+        }
+
+        // (HB)CB(CGCDCE)HE: CB to HE correlation for aromatic residues
+        if filter.should_include("hbcbcgcdcehe") {
+            if let Some(&cb_shift) = cb_shifts.get(&seq_code) {
+                let cb_ref = cb_refs.get(&seq_code).copied().unwrap_or(cb_shift);
+                for he_name in &["HE1", "HE2", "HE3"] {
+                    // Find HE in residue_protons
+                    if let Some((_, he_shift, he_ref)) = residue_protons.iter().find(|(name, _, _)| name == *he_name) {
+                        let peak = UnlabeledPeak::hbcbcgcdcehe(cb_shift, *he_shift, 1.0);
+                        let atom_desc = format!("CB/{}", he_name);
+                        let reference = vec![
+                            ("CB".to_string(), cb_ref),
+                            ("HE".to_string(), *he_ref),
+                        ];
+                        ground_truth.register_with_reference(&peak, seq_code, &atom_desc, reference);
+                        hbcbcgcdcehe.push(peak);
                     }
                 }
             }
@@ -2224,7 +2317,7 @@ fn generate_synthetic_peaks(
         }
     }
 
-    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth)
+    (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, hbcbcgcdhd, hbcbcgcdcehe, ground_truth)
 }
 
 /// Evaluate assignment results against ground truth
@@ -3110,7 +3203,7 @@ fn run_batch_mode(entry_id: u32, output_dir: PathBuf, windows: &str, verbose: bo
             let sequence = extract_sequence(&window_shifts);
 
             // Generate peaks
-            let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+            let (hsqc_15n, hsqc_13c, tocsy, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, hbcbcgcdhd, hbcbcgcdcehe, ground_truth) =
                 generate_peaks_from_bmrb(&window_shifts, filter);
 
             // Run assignment with timing
@@ -3418,7 +3511,7 @@ fn run_grid_search_mode(
 
                 for (range, shifts) in &stretch_data {
                     let sequence = extract_sequence(shifts);
-                    let (hsqc_15n, hsqc_13c, tocsy_peaks, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, ground_truth) =
+                    let (hsqc_15n, hsqc_13c, tocsy_peaks, noesy, hsqc_tocsy_15n, hsqc_tocsy_13c, hsqc_tocsy_15n_3d, hsqc_tocsy_13c_3d, hnco, hncaco, hnca, hncacb, cbcaconh, hbhaconh, _hbcbcgcdhd, _hbcbcgcdcehe, ground_truth) =
                         generate_peaks_from_bmrb(shifts, filter);
 
                     let start = Instant::now();
